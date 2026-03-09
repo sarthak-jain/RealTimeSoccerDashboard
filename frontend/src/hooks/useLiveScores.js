@@ -9,7 +9,7 @@ export function useLiveScores() {
 
   const connect = useCallback(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = import.meta.env.VITE_WS_URL || `${protocol}//${window.location.hostname}:8080`;
+    const host = import.meta.env.VITE_WS_URL || `${protocol}//${window.location.host}`;
     const ws = new WebSocket(`${host}/ws/live`);
     wsRef.current = ws;
 

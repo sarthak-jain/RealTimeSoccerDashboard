@@ -8,14 +8,23 @@ spring:
       host: ${REDIS_HOST}
       port: ${REDIS_PORT:6379}
       password: ${REDIS_PASSWORD:}
+      ssl:
+        enabled: ${REDIS_SSL:false}
   jpa:
     hibernate:
-      ddl-auto: validate
+      ddl-auto: update
+  sql:
+    init:
+      mode: always
 
 app:
   jwt:
     secret: ${JWT_SECRET}
   football-data:
-    api-key: ${FOOTBALL_DATA_API_KEY}
+    api-key: ${FOOTBALL_DATA_API_KEY:}
+  gnews:
+    api-key: ${GNEWS_API_KEY:}
+  claude:
+    api-key: ${CLAUDE_API_KEY:}
   cors:
-    allowed-origins: ${CORS_ORIGINS:https://soccer-dashboard.example.com}
+    allowed-origins: ${CORS_ORIGINS:*}

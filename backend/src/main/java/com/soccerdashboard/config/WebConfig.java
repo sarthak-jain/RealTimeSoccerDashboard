@@ -13,11 +13,16 @@ public class WebConfig implements WebMvcConfigurer {
 
     @Override
     public void addCorsMappings(CorsRegistry registry) {
-        registry.addMapping("/**")
-                .allowedOrigins(allowedOrigins.split(","))
+        var mapping = registry.addMapping("/**")
                 .allowedMethods("GET", "POST", "PUT", "DELETE", "OPTIONS")
                 .allowedHeaders("*")
                 .allowCredentials(true)
                 .maxAge(3600);
+
+        if ("*".equals(allowedOrigins.trim())) {
+            mapping.allowedOriginPatterns("*");
+        } else {
+            mapping.allowedOrigins(allowedOrigins.split(","));
+        }
     }
 }

@@ -236,7 +236,7 @@ body {
   border-color: var(--accent);
 }
 .league-btn:hover:not(.active) { border-color: var(--text-muted); }
-.league-flag { font-size: 0.85rem; }
+.league-logo { width: 18px; height: 18px; object-fit: contain; }
 .league-name { font-weight: 500; }
 
 /* === Tabs === */

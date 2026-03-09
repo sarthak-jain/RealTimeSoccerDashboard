@@ -6,22 +6,25 @@
 3. [Tech Stack & Justifications](#tech-stack--justifications)
 4. [Data Flow](#data-flow)
 5. [Real-Time Architecture](#real-time-architecture)
-6. [Caching Strategy](#caching-strategy)
-7. [Resilience Patterns](#resilience-patterns)
-8. [Authentication](#authentication)
-9. [AI/LLM Integration](#aillm-integration)
-10. [System Design Panel (Star Feature)](#system-design-panel-star-feature)
-11. [API Design](#api-design)
-12. [Database Schema](#database-schema)
-13. [Challenges & Solutions](#challenges--solutions)
-14. [Scalability Considerations](#scalability-considerations)
-15. [Interview Q&A](#interview-qa)
+6. [Streaming & Data Pipelines](#streaming--data-pipelines)
+7. [Caching Strategy](#caching-strategy)
+8. [Resilience Patterns](#resilience-patterns)
+9. [Authentication](#authentication)
+10. [AI/LLM Integration](#aillm-integration)
+11. [System Design Panel (Star Feature)](#system-design-panel-star-feature)
+12. [API Design](#api-design)
+13. [Database Schema](#database-schema)
+14. [Production Deployment (AWS)](#production-deployment-aws)
+15. [Special Features](#special-features)
+16. [Challenges & Solutions](#challenges--solutions)
+17. [Scalability Considerations](#scalability-considerations)
+18. [Interview Q&A](#interview-qa)
 
 ---
 
 ## Overview
 
-A real-time soccer dashboard that streams live scores, standings, and fixtures from external APIs, pushes updates to connected clients via WebSocket, and visualizes the entire backend pipeline in a live **System Design Panel** via SSE. Integrates Claude AI for league analysis, news digests, and workflow narration.
+A real-time soccer dashboard that streams live scores, standings, and fixtures from external APIs, pushes updates to connected clients via WebSocket, and visualizes the entire backend pipeline in a live **System Design Panel** via SSE. Integrates Claude AI for league analysis, news digests, and workflow narration. Deployed to production on AWS (ECS Fargate, RDS, ElastiCache, CloudFront).
 
 **Key metrics:**
 - 43 Java backend files, 23 frontend files
@@ -29,90 +32,108 @@ A real-time soccer dashboard that streams live scores, standings, and fixtures f
 - 30s polling interval (adaptive), 5min idle
 - Sub-second cache reads, <500ms API responses
 - 3 AI-powered features with token tracking
+- Dual streaming protocols: SSE (panel) + WebSocket (live scores)
+- Production-deployed on AWS with CDN, managed database, and container orchestration
 
 ---
 
 ## Architecture Diagram
 
 ```
+                          ┌──────────────────────────┐
+                          │       USERS (Browser)     │
+                          └────────────┬─────────────┘
+                                       │ HTTPS
+                                       ▼
+                    ┌──────────────────────────────────────┐
+                    │     AWS CloudFront (CDN)              │
+                    │     d3dj3wlvpn43fo.cloudfront.net     │
+                    │                                      │
+                    │  /* → S3 (React frontend)            │
+                    │  /api/* → ALB (backend)              │
+                    │  /ws/* → ALB (WebSocket upgrade)     │
+                    └───────┬──────────────┬───────────────┘
+                            │              │
+               Static files │              │ /api/*, /ws/*
+                            ▼              ▼
+              ┌──────────────────┐  ┌─────────────────────────┐
+              │  S3 Bucket       │  │  Application Load       │
+              │  (React + Vite)  │  │  Balancer (ALB)         │
+              │  Static hosting  │  │  idle timeout: 3600s    │
+              └──────────────────┘  │  (SSE/WebSocket support)│
+                                    └────────────┬────────────┘
+                                                 │ port 8080
+                                                 ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              CLIENTS (Browser)                              │
-│                                                                             │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌───────────────┐  │
-│  │  React UI    │  │  WebSocket   │  │  SSE Client  │  │  Auth (JWT)   │  │
-│  │  (Vite)      │  │  Live Scores │  │  Panel Trace │  │  localStorage │  │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └───────┬───────┘  │
-└─────────┼──────────────────┼──────────────────┼──────────────────┼──────────┘
-          │ HTTP/REST        │ ws://            │ SSE              │ Bearer
-          ▼                  ▼                  ▼                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         SPRING BOOT BACKEND (8080)                          │
+│                  AWS ECS Fargate (soccer-dashboard-cluster)                  │
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                        CONTROLLER LAYER                             │   │
-│  │  AuthController  LeagueController  LiveScoreController              │   │
-│  │  SearchController  FavoriteController  NewsController               │   │
-│  │  InsightController  WorkflowController  SystemController            │   │
-│  └────────────────────────────┬────────────────────────────────────────┘   │
-│                               │                                             │
-│  ┌────────────────────────────▼────────────────────────────────────────┐   │
-│  │                        SERVICE LAYER                                │   │
+│  │              SPRING BOOT BACKEND (Docker, Java 21, 512 CPU/1GB)    │   │
 │  │                                                                     │   │
-│  │  ┌──────────────┐  ┌──────────────────┐  ┌─────────────────────┐  │   │
-│  │  │ FootballData  │  │ LiveScoreAggre-  │  │ PollingScheduler   │  │   │
-│  │  │ Service       │  │ gator (merge/    │  │ (@Scheduled 30s)   │  │   │
-│  │  │ (API client)  │  │ failover)        │  │ Adaptive intervals │  │   │
-│  │  └──────┬────────┘  └────────┬─────────┘  └────────┬───────────┘  │   │
-│  │         │                    │                      │              │   │
-│  │  ┌──────▼────────┐  ┌───────▼──────────┐  ┌───────▼───────────┐  │   │
-│  │  │ CircuitBreaker│  │ DataDiffEngine   │  │ WebSocket         │  │   │
-│  │  │ (per-API)     │  │ (score/status    │  │ Broadcaster       │  │   │
-│  │  │ 3 fails→open  │  │  change detect)  │  │ (fan-out to       │  │   │
-│  │  └───────────────┘  └──────────────────┘  │  subscribed        │  │   │
-│  │  ┌───────────────┐  ┌──────────────────┐  │  clients)          │  │   │
-│  │  │ RateLimiter   │  │ InsightService   │  └───────────────────┘  │   │
-│  │  │ (10 req/min   │  │ (Claude AI)      │                         │   │
-│  │  │  sliding win) │  │ League analysis  │  ┌───────────────────┐  │   │
-│  │  └───────────────┘  └──────────────────┘  │ NarratorService   │  │   │
-│  │  ┌───────────────┐  ┌──────────────────┐  │ (Panel AI explain)│  │   │
-│  │  │ AuthService   │  │ NewsService      │  └───────────────────┘  │   │
-│  │  │ (BCrypt+JWT)  │  │ (GNews + AI      │                         │   │
-│  │  └───────────────┘  │  brief digest)   │                         │   │
-│  │                     └──────────────────┘                         │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐   │   │
+│  │  │                    CONTROLLER LAYER                         │   │   │
+│  │  │  AuthController  LeagueController  LiveScoreController     │   │   │
+│  │  │  SearchController  FavoriteController  NewsController      │   │   │
+│  │  │  InsightController  WorkflowController  SystemController   │   │   │
+│  │  └───────────────────────────┬─────────────────────────────────┘   │   │
+│  │                              │                                     │   │
+│  │  ┌───────────────────────────▼─────────────────────────────────┐   │   │
+│  │  │                    SERVICE LAYER                             │   │   │
+│  │  │                                                             │   │   │
+│  │  │  ┌──────────────┐  ┌────────────────┐  ┌────────────────┐  │   │   │
+│  │  │  │ FootballData  │  │ LiveScoreAggr- │  │ Polling        │  │   │   │
+│  │  │  │ Service       │  │ egator (merge/ │  │ Scheduler      │  │   │   │
+│  │  │  │ (API client)  │  │ failover)      │  │ (@Scheduled)   │  │   │   │
+│  │  │  └──────┬────────┘  └───────┬────────┘  └───────┬────────┘  │   │   │
+│  │  │         │                   │                    │           │   │   │
+│  │  │  ┌──────▼────────┐  ┌──────▼─────────┐  ┌──────▼────────┐  │   │   │
+│  │  │  │ CircuitBreaker│  │ DataDiffEngine │  │ WebSocket     │  │   │   │
+│  │  │  │ (per-API)     │  │ (change detect)│  │ Broadcaster   │  │   │   │
+│  │  │  └───────────────┘  └────────────────┘  └───────────────┘  │   │   │
+│  │  │  ┌───────────────┐  ┌────────────────┐  ┌───────────────┐  │   │   │
+│  │  │  │ RateLimiter   │  │ InsightService │  │ NarratorSvc   │  │   │   │
+│  │  │  │ (10 req/min)  │  │ (Claude AI)    │  │ (AI explain)  │  │   │   │
+│  │  │  └───────────────┘  └────────────────┘  └───────────────┘  │   │   │
+│  │  │  ┌───────────────┐  ┌────────────────┐                     │   │   │
+│  │  │  │ AuthService   │  │ NewsService    │                     │   │   │
+│  │  │  │ (BCrypt+JWT)  │  │ (GNews+AI)     │                     │   │   │
+│  │  │  └───────────────┘  └────────────────┘                     │   │   │
+│  │  └─────────────────────────────────────────────────────────────┘   │   │
+│  │                                                                     │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐   │   │
+│  │  │                  WORKFLOW TRACING LAYER                     │   │   │
+│  │  │  WorkflowTracer → WorkflowStep (20+) → WorkflowEmitter    │   │   │
+│  │  └─────────────────────────────────────────────────────────────┘   │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                      WORKFLOW TRACING LAYER                         │   │
-│  │  WorkflowTracer → WorkflowStep (20+ types) → WorkflowEmitter (SSE)│   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-└────────────┬──────────────────────────────────┬─────────────────────────────┘
-             │                                  │
-             ▼                                  ▼
-┌────────────────────────┐         ┌────────────────────────┐
-│     Redis 7 (6379)     │         │     MySQL 8 (3306)     │
-│                        │         │                        │
-│  standings:{code} 5min │         │  users                 │
-│  fixtures:{code}  1hr  │         │  favorite_teams        │
-│  live:scores:all  30s  │         │                        │
-│  insight:{code}   1hr  │         │                        │
-│  news:soccer      15m  │         │                        │
-│  news:brief       30m  │         │                        │
-│  teams:all        30m  │         │                        │
-└────────────────────────┘         └────────────────────────┘
-             │
-             │ (external)
-             ▼
-┌────────────────────────────────────────────────────────────┐
-│                     EXTERNAL APIs                          │
-│                                                            │
-│  ┌──────────────────┐  ┌─────────┐  ┌──────────────────┐ │
-│  │ Football-Data.org│  │ GNews   │  │ Claude API       │ │
-│  │ 10 req/min free  │  │ 100/day │  │ (Haiku 4.5)      │ │
-│  │ 12 leagues       │  │         │  │ Insights, Brief, │ │
-│  │ Standings,       │  │ Soccer  │  │ Narrator         │ │
-│  │ Fixtures, Live   │  │ news    │  │                  │ │
-│  └──────────────────┘  └─────────┘  └──────────────────┘ │
-└────────────────────────────────────────────────────────────┘
+└─────────────┬──────────────────────────────────┬──────────────────────────┘
+              │                                  │
+              ▼                                  ▼
+┌──────────────────────────────┐   ┌──────────────────────────────┐
+│  AWS ElastiCache Redis 7     │   │  AWS RDS MySQL 8             │
+│  (cache.t3.micro)            │   │  (db.t3.micro)               │
+│                              │   │                              │
+│  standings:{code}  5min TTL  │   │  users (auth)                │
+│  fixtures:{code}   1hr  TTL  │   │  favorite_teams              │
+│  live:scores:all   30s  TTL  │   │                              │
+│  insight:{code}    1hr  TTL  │   │  Encrypted at rest           │
+│  news:soccer       15m  TTL  │   │  Auto-backup enabled         │
+│  news:brief        30m  TTL  │   │                              │
+│  teams:all         30m  TTL  │   │                              │
+└──────────────────────────────┘   └──────────────────────────────┘
+
+              │ (external APIs)
+              ▼
+┌──────────────────────────────────────────────────────────────┐
+│                       EXTERNAL APIs                           │
+│                                                              │
+│  ┌──────────────────┐  ┌──────────┐  ┌───────────────────┐  │
+│  │ Football-Data.org│  │ GNews    │  │ Claude API        │  │
+│  │ 10 req/min free  │  │ 100/day  │  │ (Haiku 4.5)       │  │
+│  │ 12 leagues       │  │ Soccer   │  │ Insights, Brief,  │  │
+│  │ Standings,       │  │ news     │  │ Narrator          │  │
+│  │ Fixtures, Live   │  │ articles │  │                   │  │
+│  └──────────────────┘  └──────────┘  └───────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -128,13 +149,21 @@ A real-time soccer dashboard that streams live scores, standings, and fixtures f
 | **Auth** | JWT (jjwt 0.12.5) + BCrypt | Stateless — no server-side session storage. Token in `Authorization` header works with both REST and WebSocket. BCrypt with strength 10 for password hashing. |
 | **Real-time** | SSE + WebSocket (dual protocol) | **SSE** for System Design Panel (server→client only, auto-reconnect, works through proxies). **WebSocket** for live scores (bidirectional — clients send subscription messages). Using both demonstrates breadth. |
 | **AI** | Claude Haiku 4.5 | Fast inference (~1-2s), low cost, sufficient quality for sports analysis. Cheaper than Sonnet/Opus for high-frequency summarization. |
-| **Containerization** | Docker Compose | Single `docker-compose up` spins up MySQL, Redis, backend, frontend. Reproducible dev environment. |
+| **Containerization** | Docker Compose (dev), ECS Fargate (prod) | Single `docker-compose up` for dev. Fargate for serverless container management in production — no EC2 instances to patch. |
+| **CDN** | AWS CloudFront + S3 | Static React assets served from edge locations. CloudFront also proxies `/api/*` and `/ws/*` to the ALB, providing HTTPS termination. |
+| **Load Balancer** | AWS ALB | HTTP/2, WebSocket upgrade support, health checks on backend. 3600s idle timeout for long-lived SSE/WebSocket connections. |
+| **Managed DB** | AWS RDS MySQL (db.t3.micro) | Automated backups, encryption at rest, Multi-AZ option for HA. Free tier eligible. |
+| **Managed Cache** | AWS ElastiCache Redis (cache.t3.micro) | Same Redis 7 as local dev, but managed — automatic failover, patching, monitoring via CloudWatch. |
+| **Container Registry** | AWS ECR | Private Docker image registry in the same region as ECS. Eliminates Docker Hub rate limits. |
+| **Logs** | AWS CloudWatch | Centralized log aggregation from ECS containers. Searchable, alertable. |
 
 **Why not:**
 - **Node.js backend?** — Java matches my resume and demonstrates strong typing, Spring ecosystem knowledge.
 - **MongoDB?** — User/favorite data is relational. Redis handles the ephemeral cache layer.
 - **GraphQL?** — REST is simpler for this use case. No deeply nested queries needed.
 - **Kafka/RabbitMQ?** — Overkill for single-instance. WebSocket broadcaster handles fan-out directly. Documented as production upgrade path.
+- **AWS Lambda?** — Stateful WebSocket/SSE connections need persistent processes. Fargate provides always-on containers without Lambda's cold start and 15min execution limit.
+- **App Runner?** — Simpler but less control over networking (VPC, security groups). ECS Fargate allows fine-grained security group rules between ALB, backend, RDS, and Redis.
 
 ---
 
@@ -245,6 +274,95 @@ Client disconnects → session removed, subscription cleared
 ```
 
 This avoids broadcasting all data to all clients. A client watching only La Liga doesn't receive Premier League updates.
+
+---
+
+## Streaming & Data Pipelines
+
+This project handles **three distinct streams of data**, each with different latency requirements and delivery mechanisms.
+
+### Stream 1: Live Score Push (WebSocket — continuous)
+
+```
+Football-Data.org ──(HTTP poll 30s)──→ PollingScheduler
+                                           │
+                                    DataDiffEngine
+                                    (compare cached vs fresh)
+                                           │
+                                    Only changes extracted
+                                    (score, status, events)
+                                           │
+                                    WebSocketBroadcaster
+                                    (fan-out to subscribed clients)
+                                           │
+                               ┌───────────┼───────────┐
+                               ▼           ▼           ▼
+                          Client A     Client B     Client C
+                          (PL sub)     (PL,PD)      (SA sub)
+```
+
+**Flow:** External API → Backend poll → Diff → Selective push to subscribed clients. This is a **server-initiated streaming pipeline** — clients don't request updates, they receive them as data changes. The diff engine ensures only deltas are sent, minimizing bandwidth. Clients subscribed to different leagues only receive relevant updates.
+
+**Backpressure:** If the WebSocket send buffer fills (slow client), the message is dropped for that client — live scores are ephemeral and the next cycle will send the latest state.
+
+### Stream 2: System Design Panel (SSE — continuous)
+
+```
+Any backend operation
+  │
+  WorkflowTracer.emit(step)
+  │
+  WorkflowEmitter (CopyOnWriteArrayList<SseEmitter>)
+  │
+  Broadcast to ALL connected SSE clients
+  │
+  ┌──────────┐
+  ▼          ▼
+Browser 1   Browser 2
+(System     (System
+ Design      Design
+ Panel)      Panel)
+```
+
+**Flow:** Every backend operation (API calls, cache reads, auth checks, LLM inference) emits a `WorkflowStep` event into a server-sent event stream. This is an **append-only event log** — events are never updated or deleted, only new events arrive. The frontend groups them by `traceId` and renders them as collapsible traces.
+
+**Why this is a stream, not request/response:** The panel shows operations from ALL users and background tasks in real-time. A user watching the panel sees their own requests AND polling cycles AND other users' requests — it's a multiplexed, unbounded event stream.
+
+### Stream 3: AI Analysis Pipeline (Request-triggered, cached)
+
+```
+User request → Check cache → [HIT] → Return cached
+                    │
+                  [MISS]
+                    │
+              Fetch standings data
+                    │
+              Build prompt (standings → text)
+                    │
+              Claude API (streaming-capable)
+                    │
+              Cache result (1hr TTL)
+                    │
+              Return to client
+```
+
+**Flow:** Unlike Streams 1 and 2 which are continuous, this is a **request-triggered pipeline with aggressive caching**. The AI insight for a given league is computed once and served to all subsequent requesters for 1 hour. This converts an expensive LLM call into an amortized cost shared across all users.
+
+### How Streams Interact
+
+The three streams are **independent but observable**. Stream 2 (System Design Panel) acts as a **meta-stream** that traces operations from Streams 1 and 3:
+
+- When the polling scheduler runs (Stream 1), it emits `POLL_CYCLE_START`, `EXTERNAL_API`, `DATA_DIFF`, `WEBSOCKET_FANOUT` steps into Stream 2
+- When a user requests AI analysis (Stream 3), it emits `CACHE_CHECK`, `PROMPT_BUILD`, `LLM_INFERENCE` steps into Stream 2
+- Stream 2 is the unified observability layer for the entire system
+
+### Data Volume Characteristics
+
+| Stream | Frequency | Payload Size | Delivery | Persistence |
+|--------|-----------|-------------|----------|-------------|
+| Live Scores (WS) | Every 30s during live matches | ~2-5 KB (diff only) | Push to subscribed clients | Redis 30s TTL |
+| Panel Events (SSE) | Per-operation (~5-20 events/request) | ~200-500 bytes each | Broadcast to all viewers | In-memory only |
+| AI Analysis | On-demand, cached 1hr | ~2-3 KB (analysis text) | Request/response | Redis 1hr TTL |
 
 ---
 
@@ -532,6 +650,167 @@ CREATE TABLE favorite_teams (
 
 ---
 
+## Production Deployment (AWS)
+
+### Architecture
+
+```
+Internet
+  │
+  ▼
+CloudFront (HTTPS termination, CDN)
+  ├── /* ──────→ S3 Bucket (React SPA, gzip compressed)
+  ├── /api/* ──→ ALB ──→ ECS Fargate (Spring Boot container)
+  └── /ws/* ───→ ALB ──→ ECS Fargate (WebSocket upgrade)
+                           │                  │
+                           ▼                  ▼
+                    ElastiCache Redis    RDS MySQL
+                    (cache.t3.micro)     (db.t3.micro)
+```
+
+### AWS Services Used
+
+| Service | Configuration | Purpose |
+|---------|--------------|---------|
+| **ECS Fargate** | 0.5 vCPU, 1 GB RAM, 1 task | Runs backend Docker container. Serverless — no EC2 management. Auto-restarts unhealthy tasks. |
+| **ECR** | Private repository | Stores Docker images. Integrated with ECS for pull-on-deploy. |
+| **ALB** | Internet-facing, 3 AZs | Routes traffic to Fargate tasks. Idle timeout 3600s for SSE/WebSocket. Health checks on `/api/leagues`. |
+| **RDS MySQL** | db.t3.micro, single AZ | Managed MySQL 8. Automated backups, encryption at rest. Stores users and favorites. |
+| **ElastiCache** | cache.t3.micro, Redis 7.1 | Managed Redis. Same behavior as local dev. Handles all caching. |
+| **S3** | Static website hosting | Serves React frontend build artifacts. |
+| **CloudFront** | PriceClass_100 (US/EU) | HTTPS, CDN caching for static assets. Proxies API/WS requests to ALB. Custom error page (404 → index.html for SPA routing). |
+| **CloudWatch** | Log group `/ecs/soccer-dashboard-backend` | Container log aggregation. Searchable for debugging production issues. |
+
+### Network Security (Security Groups)
+
+```
+Internet ──(80,443)──→ ALB SG
+ALB SG ──(8080)──→ Fargate SG
+Fargate SG ──(3306)──→ RDS SG
+Fargate SG ──(6379)──→ ElastiCache SG (shared with RDS SG)
+```
+
+Three security groups enforce least-privilege:
+- **ALB SG:** Only accepts HTTP/HTTPS from the internet
+- **Fargate SG:** Only accepts traffic from the ALB on port 8080
+- **RDS/Redis SG:** Only accepts connections from Fargate tasks
+
+No service is directly exposed to the internet except the ALB. RDS and ElastiCache have no public IPs.
+
+### Docker Multi-Stage Build
+
+```dockerfile
+FROM eclipse-temurin:21-jdk AS build
+WORKDIR /app
+COPY pom.xml .
+COPY src ./src
+RUN apt-get update && apt-get install -y maven && \
+    mvn clean package -DskipTests
+
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+COPY --from=build /app/target/*.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-Xmx768m", "-jar", "-Dspring.profiles.active=prod", "app.jar"]
+```
+
+**Stage 1 (build):** Full JDK + Maven to compile. ~800MB.
+**Stage 2 (runtime):** JRE only + JAR file. ~150MB. No build tools, source code, or dependencies in production image.
+
+### Environment Configuration
+
+Production uses `application-prod.yml` with all secrets injected via environment variables in the ECS task definition:
+
+| Variable | Source | Purpose |
+|----------|--------|---------|
+| `DB_URL` | RDS endpoint | MySQL connection string |
+| `DB_USERNAME` / `DB_PASSWORD` | ECS env | Database credentials |
+| `REDIS_HOST` | ElastiCache endpoint | Redis connection |
+| `JWT_SECRET` | ECS env | Token signing key |
+| `FOOTBALL_DATA_API_KEY` | ECS env | External API auth |
+| `GNEWS_API_KEY` | ECS env | News API auth |
+| `CLAUDE_API_KEY` | ECS env | AI/LLM auth |
+| `CORS_ORIGINS` | ECS env (`*`) | Allowed CORS origins |
+
+No secrets in code or Docker images. All configuration is environment-driven.
+
+### Deployment Process
+
+```
+1. docker build -t soccer-dashboard-backend .
+2. docker tag → 123442381711.dkr.ecr.us-east-2.amazonaws.com/soccer-dashboard-backend:latest
+3. docker push → ECR
+4. aws ecs update-service --force-new-deployment → rolling update
+5. npm run build → frontend static files
+6. aws s3 sync dist/ s3://bucket/ → upload to S3
+7. aws cloudfront create-invalidation → purge CDN cache
+```
+
+ECS performs **rolling deployments**: starts new task, waits for health check to pass, drains old task. Zero-downtime deploys.
+
+### Cost Estimate
+
+| Service | Monthly Cost |
+|---------|-------------|
+| ECS Fargate (0.5 vCPU, 1GB, always-on) | ~$15 |
+| RDS MySQL (db.t3.micro) | Free tier / ~$15 |
+| ElastiCache (cache.t3.micro) | ~$12 |
+| ALB | ~$16 + data transfer |
+| S3 + CloudFront | ~$1-2 |
+| ECR | ~$1 |
+| **Total** | **~$45-60/month** |
+
+### CloudFront + WebSocket: Mixed Content Fix
+
+CloudFront serves the frontend over HTTPS. WebSocket must use `wss://` (secure) when loaded from an HTTPS page — browsers block `ws://` connections from HTTPS origins (mixed content). Solution: route `/ws/*` through CloudFront to the ALB, so WebSocket uses the same `wss://cloudfront-domain/ws/live` endpoint. CloudFront natively supports WebSocket upgrade when forwarding all headers.
+
+---
+
+## Special Features
+
+### 1. System Design Panel (Star Feature)
+
+A live visualization of every backend operation. Every API call, cache read, rate limit check, circuit breaker decision, LLM inference, and WebSocket broadcast is traced and streamed to the browser in real-time via SSE. The panel groups operations by request (traceId), color-codes them by type, and shows timing information. This transforms an opaque backend into a transparent, observable system — ideal for demonstrating system design knowledge in interviews.
+
+### 2. Dual Streaming Protocols
+
+The project uses **both** SSE and WebSocket, each chosen for its strengths:
+- **SSE** for the System Design Panel: server→client only, auto-reconnect, simpler
+- **WebSocket** for live scores: bidirectional (clients subscribe to specific leagues)
+
+Using two protocols in one project demonstrates understanding of when to use each, rather than defaulting to one.
+
+### 3. Three AI-Powered Features
+
+All powered by Claude Haiku 4.5 with cost-controlled caching:
+- **League Insight:** AI analyzes current standings and generates analysis (title race, relegation battle, surprises)
+- **News Brief ("Today's Soccer Brief"):** AI digests multiple news articles into a concise daily briefing
+- **Panel Narrator:** AI watches System Design Panel events and explains what's happening in plain English
+
+Each feature is fully traced in the System Design Panel, showing prompt construction, token usage, and caching behavior.
+
+### 4. Adaptive Polling with Smart Quota Management
+
+The polling scheduler adapts its behavior based on system state:
+- Polls every 30s during live matches with connected clients
+- Drops to 5min intervals when no live matches
+- Skips entirely when no clients are connected
+- Rate limiter tracks API quota independently of circuit breaker state
+
+### 5. Demo Mode
+
+A toggle that replays recorded match data with simulated live updates. Ensures the real-time experience works even when no live matches are playing — critical for interviews and demonstrations.
+
+### 6. Full Observability Pipeline
+
+Every backend operation flows through the workflow tracing layer:
+```
+Operation → WorkflowTracer → WorkflowStep → WorkflowEmitter → SSE → Browser Panel
+```
+This means any new feature automatically becomes visible in the System Design Panel by adding trace calls. The AI Narrator can explain any operation because it receives the same event stream.
+
+---
+
 ## Challenges & Solutions
 
 ### 1. Rate Limiter Tripping Circuit Breakers
@@ -594,34 +873,90 @@ CREATE TABLE favorite_teams (
 
 **Lesson:** Always provide operational escape hatches for stateful components. In production, this would be a protected admin endpoint.
 
+### 8. CORS Wildcard + Credentials Conflict (Production)
+
+**Problem:** Production backend used `CORS_ORIGINS=*` with `allowCredentials(true)`. Spring Security throws `IllegalArgumentException: When allowCredentials is true, allowedOrigins cannot contain the special value "*"`. Health checks returned 500, ECS tasks marked unhealthy.
+
+**Root cause:** The CORS spec forbids `Access-Control-Allow-Origin: *` with `Access-Control-Allow-Credentials: true` because it would allow any site to make authenticated requests.
+
+**Fix:** When `CORS_ORIGINS=*`, use `allowedOriginPatterns("*")` instead of `allowedOrigins("*")`. Pattern matching allows wildcard with credentials because the response header echoes back the specific requesting origin, not `*`.
+
+```java
+if ("*".equals(allowedOrigins.trim())) {
+    mapping.allowedOriginPatterns("*");
+} else {
+    mapping.allowedOrigins(allowedOrigins.split(","));
+}
+```
+
+**Lesson:** Test CORS configuration in production-like settings. Dev environments often don't trigger this because they use explicit origins (`http://localhost:5173`).
+
+### 9. Mixed Content — WebSocket Over HTTPS
+
+**Problem:** CloudFront serves the frontend over HTTPS. The frontend tried to connect to `ws://alb-host/ws/live` (insecure WebSocket). Browsers block mixed content — `ws://` from an `https://` page throws `SecurityError`.
+
+**Root cause:** Frontend used `window.location.hostname:8080` as WebSocket host, bypassing CloudFront.
+
+**Fix:** Two changes:
+1. Added `/ws/*` cache behavior in CloudFront routing to the ALB origin (CloudFront natively supports WebSocket upgrade)
+2. Changed frontend from `hostname:8080` to `window.location.host` so WebSocket uses the same CloudFront origin: `wss://d3dj3wlvpn43fo.cloudfront.net/ws/live`
+
+**Lesson:** When fronting a backend with HTTPS (CloudFront, nginx), ALL protocols must route through the HTTPS proxy — REST, SSE, and WebSocket.
+
+### 10. Git Bash Path Mangling on Windows (DevOps)
+
+**Problem:** AWS CLI commands with Unix-style paths like `--log-group-name /ecs/soccer-dashboard-backend` were converted by Git Bash (MSYS2) to `C:/Program Files/Git/ecs/soccer-dashboard-backend`. CloudWatch, health check paths, and other AWS resources couldn't be created.
+
+**Root cause:** MSYS2 (Git Bash's underlying layer) auto-converts any argument starting with `/` to a Windows path, thinking it's a Unix path reference.
+
+**Fix:** Prefix commands with `MSYS_NO_PATHCONV=1` to disable path conversion:
+```bash
+MSYS_NO_PATHCONV=1 aws logs create-log-group --log-group-name /ecs/soccer-dashboard-backend
+```
+
+**Lesson:** Git Bash on Windows introduces subtle compatibility issues with tools that use `/` in arguments. For production deployments, use WSL, PowerShell, or CI/CD pipelines to avoid this class of issues.
+
+### 11. ALB Idle Timeout for Long-Lived Connections
+
+**Problem:** Default ALB idle timeout is 60 seconds. SSE connections (System Design Panel) and WebSocket connections (live scores) stay open for the entire browser session — minutes to hours.
+
+**Fix:** Set ALB `idle_timeout.timeout_seconds` to 3600 (1 hour). Frontend hooks have auto-reconnect (SSE: built-in `EventSource`, WebSocket: exponential backoff) as a safety net.
+
+**Lesson:** Long-lived HTTP connections (SSE, WebSocket, long-polling) require load balancer timeout configuration. The default 60s is designed for request/response patterns.
+
 ---
 
 ## Scalability Considerations
 
-### Current Architecture (Single Instance)
+### Current Architecture (Production — Single Task)
 
-Works for portfolio demo scale (~50 concurrent users). Bottlenecks at scale:
+Deployed on AWS ECS Fargate with a single task (0.5 vCPU, 1GB RAM). Works for portfolio demo scale (~50 concurrent users). Bottlenecks at scale:
 
-| Component | Limit | Solution at Scale |
-|-----------|-------|-------------------|
-| WebSocket connections | ~1000 per JVM | STOMP + RabbitMQ message broker |
-| SSE connections | ~1000 per JVM | Load balance with sticky sessions |
-| Polling scheduler | Single thread | Distribute with Redis-based leader election |
-| Redis | Single instance | Redis Cluster or ElastiCache |
-| MySQL | Single instance | RDS Multi-AZ with read replicas |
-| API quota | 10 req/min | Multiple API keys, request pooling |
+| Component | Current | Limit | Solution at Scale |
+|-----------|---------|-------|-------------------|
+| ECS tasks | 1 Fargate task | ~1000 WS connections | Auto-scale to N tasks behind ALB |
+| WebSocket | In-process broadcaster | Single JVM | STOMP + RabbitMQ message broker |
+| SSE | In-process emitter | Single JVM | Redis Pub/Sub for cross-instance events |
+| Polling | Single @Scheduled thread | One poller | Redis-based leader election |
+| ElastiCache | cache.t3.micro | Low throughput | Upgrade node type or add replicas |
+| RDS MySQL | db.t3.micro, single AZ | No failover | Multi-AZ deployment + read replicas |
+| API quota | 10 req/min | 14,400/day | Multiple API keys, request pooling |
 
 ### What I Would Change for 10K+ Users
 
-1. **Add a message broker (RabbitMQ/Kafka):** Decouple polling from WebSocket broadcasting. Poller publishes to a topic, multiple WebSocket servers consume and fan out.
+1. **ECS auto-scaling:** Add target tracking policy on CPU/connection count. ALB distributes across multiple Fargate tasks.
 
-2. **Horizontal WebSocket scaling:** Use Spring's STOMP over WebSocket with a message broker backing. Each server handles a subset of connections.
+2. **Add a message broker (RabbitMQ/Kafka):** Decouple polling from WebSocket broadcasting. Poller publishes to a topic, multiple WebSocket servers consume and fan out. This is the single most important change for horizontal scaling.
 
-3. **Redis Cluster:** Shard cache keys across nodes. Add pub/sub for cache invalidation across instances.
+3. **Horizontal WebSocket scaling:** Use Spring's STOMP over WebSocket with a message broker backing. Each Fargate task handles a subset of connections. ALB sticky sessions ensure WebSocket upgrades go to the same task.
 
-4. **CDN for frontend:** S3 + CloudFront. Static assets served from edge locations.
+4. **Redis Pub/Sub for SSE:** When one task receives a workflow event, publish to Redis channel. All tasks subscribe and broadcast to their local SSE clients.
 
-5. **Rate limiting with Redis:** Move from in-memory sliding window to Redis-backed (e.g., `INCR` + `EXPIRE`). Shared across instances.
+5. **Rate limiting with Redis:** Move from in-memory sliding window to Redis-backed (`INCR` + `EXPIRE`). Shared across all Fargate tasks to prevent exceeding API quota.
+
+6. **RDS Multi-AZ:** Enable Multi-AZ for automatic failover. Add read replicas if query load increases.
+
+7. **ElastiCache cluster mode:** Shard cache keys across nodes for higher throughput.
 
 ---
 
@@ -661,6 +996,22 @@ It compares the previous cached match list against the fresh API response. It ch
 6. User clicks AI Analysis → `GET /api/insights/PL` → Claude Haiku generates analysis → cached for 1hr
 7. Second user loads same league → all cache HITs → sub-5ms response
 
+### "How did you deploy this to production?"
+
+The backend runs as a Docker container on **ECS Fargate** — serverless containers, no EC2 instances to manage. It sits behind an **ALB** (Application Load Balancer) with a 3600s idle timeout for SSE/WebSocket. **RDS MySQL** and **ElastiCache Redis** provide managed database and cache. The React frontend is a static build deployed to **S3** behind **CloudFront** for HTTPS and CDN caching. CloudFront routes `/api/*` and `/ws/*` to the ALB, so everything goes through a single HTTPS domain. All secrets are injected via ECS task definition environment variables — nothing in code or Docker images.
+
+### "How does this project handle streams of data?"
+
+Three independent streams: (1) **Live scores via WebSocket** — the backend polls Football-Data.org every 30s, diffs against cached data, and pushes only the changes to subscribed clients. This is a server-initiated push stream with selective fan-out. (2) **System Design Panel via SSE** — an append-only event stream where every backend operation emits trace events. Multiple users see each other's traces plus background polling. This is a multiplexed, unbounded event log. (3) **AI analysis pipeline** — request-triggered with aggressive caching. One LLM call is amortized across all users for 1 hour. The three streams are independent but the SSE panel acts as a meta-stream, tracing operations from the other two.
+
+### "Why ECS Fargate over Lambda or EC2?"
+
+Lambda has a 15-minute execution limit and cold starts — incompatible with long-lived WebSocket/SSE connections that persist for the entire browser session. EC2 would work but requires patching, scaling configuration, and OS management. Fargate gives always-on containers with zero infrastructure management. I define the CPU/memory (0.5 vCPU, 1GB), push a Docker image, and ECS handles placement, restarts, and health checks.
+
+### "How do you handle the CloudFront + WebSocket interaction?"
+
+CloudFront natively supports WebSocket — when it receives a request with `Upgrade: websocket` header, it forwards it to the origin (ALB) and establishes a persistent connection. I added a `/ws/*` cache behavior in CloudFront that forwards all headers to the ALB. This way, both REST API and WebSocket use the same HTTPS CloudFront domain, avoiding mixed-content browser security errors.
+
 ### "What would you do differently if starting over?"
 
 - **Use WebClient instead of RestTemplate** for non-blocking HTTP calls. RestTemplate is synchronous and blocks a thread per request.
@@ -668,3 +1019,5 @@ It compares the previous cached match list against the fresh API response. It ch
 - **TypeScript on the frontend** for better type safety across the many component props.
 - **Integration tests** with Testcontainers for Redis and MySQL.
 - **OpenAPI/Swagger** for API documentation.
+- **CI/CD pipeline** with GitHub Actions: build → test → push to ECR → deploy to ECS on every push to main.
+- **AWS Secrets Manager** instead of plain environment variables for sensitive values like API keys and database passwords.
