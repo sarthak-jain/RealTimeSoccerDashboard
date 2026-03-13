@@ -12,6 +12,8 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -31,17 +33,34 @@ public class NewsService {
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
     private final RedisTemplate<String, Object> redisTemplate;
+    private final Counter inputTokenCounter;
+    private final Counter outputTokenCounter;
+    private final Counter cacheHitCounter;
+    private final Counter cacheMissCounter;
 
     public NewsService(
             @Value("${app.gnews.api-key:}") String apiKey,
             @Value("${app.claude.api-key:}") String claudeApiKey,
             ObjectMapper objectMapper,
-            RedisTemplate<String, Object> redisTemplate) {
+            RedisTemplate<String, Object> redisTemplate,
+            MeterRegistry meterRegistry) {
         this.apiKey = apiKey;
         this.claudeApiKey = claudeApiKey;
         this.restTemplate = new RestTemplate();
         this.objectMapper = objectMapper;
         this.redisTemplate = redisTemplate;
+        this.inputTokenCounter = Counter.builder("llm.tokens")
+                .tag("direction", "input").tag("model", "claude-haiku-4-5").tag("operation", "news_brief")
+                .register(meterRegistry);
+        this.outputTokenCounter = Counter.builder("llm.tokens")
+                .tag("direction", "output").tag("model", "claude-haiku-4-5").tag("operation", "news_brief")
+                .register(meterRegistry);
+        this.cacheHitCounter = Counter.builder("cache.operations")
+                .tag("operation", "hit").tag("key_pattern", "news")
+                .register(meterRegistry);
+        this.cacheMissCounter = Counter.builder("cache.operations")
+                .tag("operation", "miss").tag("key_pattern", "news")
+                .register(meterRegistry);
     }
 
     public Map<String, Object> getNews(WorkflowTracer.Trace trace) {
@@ -54,6 +73,7 @@ public class NewsService {
 
         if (cached != null) {
             trace.emitCacheCheck(cacheKey, WorkflowStep.CacheStatus.HIT, cacheMs);
+            cacheHitCounter.increment();
             try {
                 String json = cached instanceof String ? (String) cached : objectMapper.writeValueAsString(cached);
                 return objectMapper.readValue(json,
@@ -63,6 +83,7 @@ public class NewsService {
             }
         }
         trace.emitCacheCheck(cacheKey, WorkflowStep.CacheStatus.MISS, cacheMs);
+        cacheMissCounter.increment();
 
         if (apiKey == null || apiKey.isEmpty()) {
             trace.emitError("GNews", "No API key configured", 0);
@@ -129,6 +150,7 @@ public class NewsService {
 
         if (cached != null) {
             trace.emitCacheCheck(cacheKey, WorkflowStep.CacheStatus.HIT, cacheMs);
+            cacheHitCounter.increment();
             try {
                 String json = cached instanceof String ? (String) cached : objectMapper.writeValueAsString(cached);
                 Map<String, Object> cachedResult = objectMapper.readValue(json,
@@ -157,6 +179,7 @@ public class NewsService {
             }
         }
         trace.emitCacheCheck(cacheKey, WorkflowStep.CacheStatus.MISS, cacheMs);
+        cacheMissCounter.increment();
 
         // Fetch articles first
         Map<String, Object> newsData = getNews(trace);
@@ -232,6 +255,8 @@ public class NewsService {
                 inputTokens = responseJson.path("usage").path("input_tokens").asInt(0);
                 outputTokens = responseJson.path("usage").path("output_tokens").asInt(0);
             }
+            inputTokenCounter.increment(inputTokens);
+            outputTokenCounter.increment(outputTokens);
 
             String brief = "";
             if (responseJson.has("content") && responseJson.get("content").isArray()) {

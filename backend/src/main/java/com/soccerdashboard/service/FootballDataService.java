@@ -7,6 +7,9 @@ import com.soccerdashboard.resilience.CircuitBreaker;
 import com.soccerdashboard.resilience.RateLimiter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -29,6 +32,8 @@ public class FootballDataService {
     private final RateLimiter rateLimiter;
     private final CircuitBreaker<List<Match>> matchCircuitBreaker;
     private final CircuitBreaker<JsonNode> jsonCircuitBreaker;
+    private final Timer apiTimer;
+    private final Counter rateLimitRejectionsCounter;
 
     // Football-Data.org league codes
     public static final Map<String, String> LEAGUE_CODES = new LinkedHashMap<>() {{
@@ -49,7 +54,8 @@ public class FootballDataService {
     public FootballDataService(
             @Value("${app.football-data.api-key:}") String apiKey,
             @Value("${app.football-data.base-url:https://api.football-data.org/v4}") String baseUrl,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            MeterRegistry meterRegistry) {
         this.apiKey = apiKey;
         this.baseUrl = baseUrl;
         this.objectMapper = objectMapper;
@@ -57,6 +63,12 @@ public class FootballDataService {
         this.rateLimiter = new RateLimiter("Football-Data.org", 10, 60_000); // 10 req/min
         this.matchCircuitBreaker = new CircuitBreaker<>("Football-Data-matches", 3, 60_000, Collections::emptyList);
         this.jsonCircuitBreaker = new CircuitBreaker<>("Football-Data-json", 3, 60_000, () -> objectMapper.createObjectNode());
+        this.apiTimer = Timer.builder("external_api.latency")
+                .tag("service", "football-data")
+                .register(meterRegistry);
+        this.rateLimitRejectionsCounter = Counter.builder("rate_limiter.rejections")
+                .tag("name", "Football-Data.org")
+                .register(meterRegistry);
     }
 
     public List<Map<String, Object>> getLeagues() {
@@ -74,61 +86,66 @@ public class FootballDataService {
     public JsonNode getStandings(String leagueCode) {
         if (!rateLimiter.tryAcquire()) {
             log.warn("Rate limit exceeded for Football-Data.org (getStandings)");
+            rateLimitRejectionsCounter.increment();
             return objectMapper.createObjectNode();
         }
-        return jsonCircuitBreaker.execute(() -> {
+        return apiTimer.record(() -> jsonCircuitBreaker.execute(() -> {
             String url = baseUrl + "/competitions/" + leagueCode + "/standings";
             ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, createEntity(), String.class);
             return parseJson(response.getBody());
-        });
+        }));
     }
 
     public JsonNode getFixtures(String leagueCode) {
         if (!rateLimiter.tryAcquire()) {
             log.warn("Rate limit exceeded for Football-Data.org (getFixtures)");
+            rateLimitRejectionsCounter.increment();
             return objectMapper.createObjectNode();
         }
-        return jsonCircuitBreaker.execute(() -> {
+        return apiTimer.record(() -> jsonCircuitBreaker.execute(() -> {
             String url = baseUrl + "/competitions/" + leagueCode + "/matches?status=SCHEDULED&limit=15";
             ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, createEntity(), String.class);
             return parseJson(response.getBody());
-        });
+        }));
     }
 
     public List<Match> getLiveMatches() {
         if (!rateLimiter.tryAcquire()) {
             log.warn("Rate limit exceeded for Football-Data.org (getLiveMatches)");
+            rateLimitRejectionsCounter.increment();
             return Collections.emptyList();
         }
-        return matchCircuitBreaker.execute(() -> {
+        return apiTimer.record(() -> matchCircuitBreaker.execute(() -> {
             String url = baseUrl + "/matches?status=LIVE,IN_PLAY,PAUSED";
             ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, createEntity(), String.class);
             return parseMatches(parseJson(response.getBody()));
-        });
+        }));
     }
 
     public List<Match> getTodaysMatches() {
         if (!rateLimiter.tryAcquire()) {
             log.warn("Rate limit exceeded for Football-Data.org (getTodaysMatches)");
+            rateLimitRejectionsCounter.increment();
             return Collections.emptyList();
         }
-        return matchCircuitBreaker.execute(() -> {
+        return apiTimer.record(() -> matchCircuitBreaker.execute(() -> {
             String url = baseUrl + "/matches";
             ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, createEntity(), String.class);
             return parseMatches(parseJson(response.getBody()));
-        });
+        }));
     }
 
     public JsonNode getCompetitionTeams(String competitionCode) {
         if (!rateLimiter.tryAcquire()) {
             log.warn("Rate limit exceeded for Football-Data.org (getCompetitionTeams)");
+            rateLimitRejectionsCounter.increment();
             return objectMapper.createObjectNode();
         }
-        return jsonCircuitBreaker.execute(() -> {
+        return apiTimer.record(() -> jsonCircuitBreaker.execute(() -> {
             String url = baseUrl + "/competitions/" + competitionCode + "/teams";
             ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, createEntity(), String.class);
             return parseJson(response.getBody());
-        });
+        }));
     }
 
     private List<Match> parseMatches(JsonNode root) {

@@ -1,0 +1,11 @@
+init_config:
+
+instances:
+  - host: mysql
+    port: 3306
+    username: datadog
+    password: datadog
+    dbm: false
+    tags:
+      - env:dev
+      - service:soccer-dashboard-backend

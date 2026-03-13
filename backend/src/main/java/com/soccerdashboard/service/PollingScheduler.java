@@ -3,6 +3,9 @@ package com.soccerdashboard.service;
 import com.soccerdashboard.model.Match;
 import com.soccerdashboard.workflow.WorkflowEmitter;
 import com.soccerdashboard.workflow.WorkflowTracer;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -27,6 +30,8 @@ public class PollingScheduler {
     private final WorkflowEmitter workflowEmitter;
     private final RedisTemplate<String, Object> redisTemplate;
     private final DemoService demoService;
+    private final Timer pollCycleTimer;
+    private final Counter dataDiffCounter;
 
     private final AtomicReference<List<Match>> previousMatches = new AtomicReference<>(new ArrayList<>());
     private final AtomicBoolean demoMode = new AtomicBoolean(false);
@@ -36,17 +41,24 @@ public class PollingScheduler {
                             WorkflowTracer workflowTracer,
                             WorkflowEmitter workflowEmitter,
                             RedisTemplate<String, Object> redisTemplate,
-                            DemoService demoService) {
+                            DemoService demoService,
+                            MeterRegistry meterRegistry) {
         this.footballDataService = footballDataService;
         this.webSocketBroadcaster = webSocketBroadcaster;
         this.workflowTracer = workflowTracer;
         this.workflowEmitter = workflowEmitter;
         this.redisTemplate = redisTemplate;
         this.demoService = demoService;
+        this.pollCycleTimer = Timer.builder("polling.cycle_duration").register(meterRegistry);
+        this.dataDiffCounter = Counter.builder("polling.data_diff_count").register(meterRegistry);
     }
 
     @Scheduled(fixedDelayString = "${app.polling.live-interval-ms:30000}")
     public void pollLiveScores() {
+        pollCycleTimer.record(this::doPollLiveScores);
+    }
+
+    private void doPollLiveScores() {
         int cycleNumber = workflowTracer.getCurrentCycleNumber() + 1;
         WorkflowTracer.Trace trace = workflowTracer.startPollCycle();
 
@@ -99,6 +111,7 @@ public class PollingScheduler {
         // Data diff
         DataDiffEngine.DataDiff diff = DataDiffEngine.diff(previousMatches.get(), currentMatches);
         trace.emitDataDiff(diff.getScoreChanges().size(), 0, diff.getStatusChanges().size());
+        dataDiffCounter.increment(diff.getTotalChanges());
 
         // Update cache
         long cacheStart = System.nanoTime();

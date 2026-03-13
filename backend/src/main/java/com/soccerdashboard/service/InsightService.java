@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.soccerdashboard.workflow.WorkflowStep;
 import com.soccerdashboard.workflow.WorkflowTracer;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -26,15 +28,24 @@ public class InsightService {
     private final ObjectMapper objectMapper;
     private final RedisTemplate<String, Object> redisTemplate;
     private final RestTemplate restTemplate;
+    private final Counter inputTokenCounter;
+    private final Counter outputTokenCounter;
 
     public InsightService(
             @Value("${app.claude.api-key:}") String apiKey,
             ObjectMapper objectMapper,
-            RedisTemplate<String, Object> redisTemplate) {
+            RedisTemplate<String, Object> redisTemplate,
+            MeterRegistry meterRegistry) {
         this.apiKey = apiKey;
         this.objectMapper = objectMapper;
         this.redisTemplate = redisTemplate;
         this.restTemplate = new RestTemplate();
+        this.inputTokenCounter = Counter.builder("llm.tokens")
+                .tag("direction", "input").tag("model", "claude-haiku-4-5").tag("operation", "league_insight")
+                .register(meterRegistry);
+        this.outputTokenCounter = Counter.builder("llm.tokens")
+                .tag("direction", "output").tag("model", "claude-haiku-4-5").tag("operation", "league_insight")
+                .register(meterRegistry);
     }
 
     public Map<String, Object> getLeagueInsight(String leagueCode, JsonNode standings, WorkflowTracer.Trace trace) {
@@ -163,6 +174,8 @@ public class InsightService {
                 inputTokens = responseJson.get("usage").has("input_tokens") ? responseJson.get("usage").get("input_tokens").asInt() : 0;
                 outputTokens = responseJson.get("usage").has("output_tokens") ? responseJson.get("usage").get("output_tokens").asInt() : 0;
             }
+            inputTokenCounter.increment(inputTokens);
+            outputTokenCounter.increment(outputTokens);
 
             String insight = "";
             if (responseJson.has("content") && responseJson.get("content").isArray()) {

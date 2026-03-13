@@ -1,5 +1,6 @@
 import { createContext, useState, useEffect, useCallback } from 'react';
 import api from '../services/api';
+import { datadogRum } from '@datadog/browser-rum';
 
 export const AuthContext = createContext(null);
 
@@ -25,6 +26,7 @@ export function AuthProvider({ children }) {
     localStorage.setItem('user', JSON.stringify({ username: data.username, email: data.email }));
     setToken(data.token);
     setUser({ username: data.username, email: data.email });
+    datadogRum.setUser({ id: data.email, name: data.username, email: data.email });
     return data;
   }, []);
 
@@ -34,6 +36,7 @@ export function AuthProvider({ children }) {
     localStorage.setItem('user', JSON.stringify({ username: data.username, email: data.email }));
     setToken(data.token);
     setUser({ username: data.username, email: data.email });
+    datadogRum.setUser({ id: data.email, name: data.username, email: data.email });
     return data;
   }, []);
 
@@ -42,6 +45,7 @@ export function AuthProvider({ children }) {
     localStorage.removeItem('user');
     setToken(null);
     setUser(null);
+    datadogRum.clearUser();
   }, []);
 
   return (

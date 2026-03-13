@@ -6,6 +6,8 @@ import com.soccerdashboard.model.Match;
 import com.soccerdashboard.resilience.CircuitBreaker;
 import com.soccerdashboard.workflow.WorkflowStep;
 import com.soccerdashboard.workflow.WorkflowTracer;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -23,15 +25,24 @@ public class LiveScoreAggregator {
     private final RedisTemplate<String, Object> redisTemplate;
     private final ObjectMapper objectMapper;
     private final WorkflowTracer workflowTracer;
+    private final Counter cacheHitCounter;
+    private final Counter cacheMissCounter;
 
     public LiveScoreAggregator(FootballDataService footballDataService,
                                RedisTemplate<String, Object> redisTemplate,
                                ObjectMapper objectMapper,
-                               WorkflowTracer workflowTracer) {
+                               WorkflowTracer workflowTracer,
+                               MeterRegistry meterRegistry) {
         this.footballDataService = footballDataService;
         this.redisTemplate = redisTemplate;
         this.objectMapper = objectMapper;
         this.workflowTracer = workflowTracer;
+        this.cacheHitCounter = Counter.builder("cache.operations")
+                .tag("operation", "hit").tag("key_pattern", "live_scores")
+                .register(meterRegistry);
+        this.cacheMissCounter = Counter.builder("cache.operations")
+                .tag("operation", "miss").tag("key_pattern", "live_scores")
+                .register(meterRegistry);
     }
 
     public List<Match> getLiveMatches(WorkflowTracer.Trace trace) {
@@ -42,6 +53,7 @@ public class LiveScoreAggregator {
 
         if (cached != null) {
             trace.emitCacheCheck("live:scores:all", WorkflowStep.CacheStatus.HIT, cacheMs);
+            cacheHitCounter.increment();
             try {
                 String json = objectMapper.writeValueAsString(cached);
                 return Arrays.asList(objectMapper.readValue(json, Match[].class));
@@ -50,6 +62,7 @@ public class LiveScoreAggregator {
             }
         }
         trace.emitCacheCheck("live:scores:all", WorkflowStep.CacheStatus.MISS, cacheMs);
+        cacheMissCounter.increment();
 
         // Select API source
         String source = selectApiSource(trace);
@@ -90,6 +103,7 @@ public class LiveScoreAggregator {
 
         if (cached != null) {
             trace.emitCacheCheck(cacheKey, WorkflowStep.CacheStatus.HIT, cacheMs);
+            cacheHitCounter.increment();
             try {
                 if (cached instanceof String) {
                     return objectMapper.readTree((String) cached);
@@ -100,6 +114,7 @@ public class LiveScoreAggregator {
             }
         }
         trace.emitCacheCheck(cacheKey, WorkflowStep.CacheStatus.MISS, cacheMs);
+        cacheMissCounter.increment();
 
         // Check rate limit
         int remaining = footballDataService.getRateLimiter().getRemainingQuota();
@@ -141,6 +156,7 @@ public class LiveScoreAggregator {
 
         if (cached != null) {
             trace.emitCacheCheck(cacheKey, WorkflowStep.CacheStatus.HIT, cacheMs);
+            cacheHitCounter.increment();
             try {
                 if (cached instanceof String) {
                     return objectMapper.readTree((String) cached);
@@ -151,6 +167,7 @@ public class LiveScoreAggregator {
             }
         }
         trace.emitCacheCheck(cacheKey, WorkflowStep.CacheStatus.MISS, cacheMs);
+        cacheMissCounter.increment();
 
         long apiStart = System.nanoTime();
         JsonNode fixtures;
@@ -188,6 +205,7 @@ public class LiveScoreAggregator {
 
         if (cached != null) {
             trace.emitCacheCheck(cacheKey, WorkflowStep.CacheStatus.HIT, cacheMs);
+            cacheHitCounter.increment();
             try {
                 String json = objectMapper.writeValueAsString(cached);
                 return Arrays.asList(objectMapper.readValue(json, Match[].class));
@@ -196,6 +214,7 @@ public class LiveScoreAggregator {
             }
         }
         trace.emitCacheCheck(cacheKey, WorkflowStep.CacheStatus.MISS, cacheMs);
+        cacheMissCounter.increment();
 
         long apiStart = System.nanoTime();
         List<Match> matches;

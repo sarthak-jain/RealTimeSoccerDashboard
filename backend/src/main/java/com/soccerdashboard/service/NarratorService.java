@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.soccerdashboard.workflow.WorkflowStep;
 import com.soccerdashboard.workflow.WorkflowTracer;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -26,15 +28,24 @@ public class NarratorService {
     private final String apiKey;
     private final ObjectMapper objectMapper;
     private final RestTemplate restTemplate;
+    private final Counter inputTokenCounter;
+    private final Counter outputTokenCounter;
     private volatile long lastNarrationTime = 0;
     private volatile String lastNarration = "";
 
     public NarratorService(
             @Value("${app.claude.api-key:}") String apiKey,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            MeterRegistry meterRegistry) {
         this.apiKey = apiKey;
         this.objectMapper = objectMapper;
         this.restTemplate = new RestTemplate();
+        this.inputTokenCounter = Counter.builder("llm.tokens")
+                .tag("direction", "input").tag("model", "claude-haiku-4-5").tag("operation", "narrate")
+                .register(meterRegistry);
+        this.outputTokenCounter = Counter.builder("llm.tokens")
+                .tag("direction", "output").tag("model", "claude-haiku-4-5").tag("operation", "narrate")
+                .register(meterRegistry);
     }
 
     public Map<String, Object> narrate(List<Map<String, Object>> events, WorkflowTracer.Trace trace) {
@@ -122,6 +133,8 @@ public class NarratorService {
                 inputTokens = responseJson.path("usage").path("input_tokens").asInt(0);
                 outputTokens = responseJson.path("usage").path("output_tokens").asInt(0);
             }
+            inputTokenCounter.increment(inputTokens);
+            outputTokenCounter.increment(outputTokens);
 
             String narration = "";
             if (responseJson.has("content") && responseJson.get("content").isArray()) {

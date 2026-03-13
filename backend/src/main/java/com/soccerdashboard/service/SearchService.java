@@ -6,6 +6,8 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.soccerdashboard.workflow.WorkflowStep;
 import com.soccerdashboard.workflow.WorkflowTracer;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -24,6 +26,8 @@ public class SearchService {
     private final RedisTemplate<String, Object> redisTemplate;
     private final ObjectMapper objectMapper;
     private final WorkflowTracer workflowTracer;
+    private final Counter cacheHitCounter;
+    private final Counter cacheMissCounter;
 
     // Cache teams in memory to avoid hammering the API
     private List<Map<String, Object>> cachedTeams = null;
@@ -33,11 +37,18 @@ public class SearchService {
     public SearchService(FootballDataService footballDataService,
                          RedisTemplate<String, Object> redisTemplate,
                          ObjectMapper objectMapper,
-                         WorkflowTracer workflowTracer) {
+                         WorkflowTracer workflowTracer,
+                         MeterRegistry meterRegistry) {
         this.footballDataService = footballDataService;
         this.redisTemplate = redisTemplate;
         this.objectMapper = objectMapper;
         this.workflowTracer = workflowTracer;
+        this.cacheHitCounter = Counter.builder("cache.operations")
+                .tag("operation", "hit").tag("key_pattern", "search")
+                .register(meterRegistry);
+        this.cacheMissCounter = Counter.builder("cache.operations")
+                .tag("operation", "miss").tag("key_pattern", "search")
+                .register(meterRegistry);
     }
 
     public Map<String, Object> search(String query) {
@@ -77,6 +88,7 @@ public class SearchService {
         // Check in-memory cache
         if (cachedTeams != null && System.currentTimeMillis() - cacheTimestamp < TEAM_CACHE_TTL) {
             trace.emitCacheCheck("teams:all", WorkflowStep.CacheStatus.HIT, 0);
+            cacheHitCounter.increment();
             return cachedTeams;
         }
 
@@ -87,6 +99,7 @@ public class SearchService {
 
         if (cached != null) {
             trace.emitCacheCheck("search:all_teams", WorkflowStep.CacheStatus.HIT, cacheMs);
+            cacheHitCounter.increment();
             try {
                 String json = cached instanceof String ? (String) cached : objectMapper.writeValueAsString(cached);
                 List<Map<String, Object>> teams = objectMapper.readValue(json,
@@ -99,6 +112,7 @@ public class SearchService {
             }
         }
         trace.emitCacheCheck("search:all_teams", WorkflowStep.CacheStatus.MISS, cacheMs);
+        cacheMissCounter.increment();
 
         // Fetch from top 3 leagues to build a good team database without burning quota
         List<Map<String, Object>> teams = new ArrayList<>();

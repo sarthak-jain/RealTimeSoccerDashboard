@@ -28,3 +28,16 @@ app:
     api-key: ${CLAUDE_API_KEY:}
   cors:
     allowed-origins: ${CORS_ORIGINS:*}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  metrics:
+    export:
+      statsd:
+        enabled: true
+        host: ${DD_AGENT_HOST:datadog-agent}
+        port: 8125
+        flavor: datadog

@@ -2,6 +2,8 @@ package com.soccerdashboard.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.soccerdashboard.model.Match;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -25,9 +27,11 @@ public class WebSocketBroadcaster extends TextWebSocketHandler {
     private final Map<String, WebSocketSession> sessions = new ConcurrentHashMap<>();
     private final Map<String, Set<String>> subscriptions = new ConcurrentHashMap<>(); // sessionId -> leagues
     private final ObjectMapper objectMapper;
+    private final Counter broadcastCounter;
 
-    public WebSocketBroadcaster(ObjectMapper objectMapper) {
+    public WebSocketBroadcaster(ObjectMapper objectMapper, MeterRegistry meterRegistry) {
         this.objectMapper = objectMapper;
+        this.broadcastCounter = Counter.builder("websocket.broadcasts").register(meterRegistry);
     }
 
     @Override
@@ -120,6 +124,7 @@ public class WebSocketBroadcaster extends TextWebSocketHandler {
     }
 
     private void broadcastToSubscribers(String leagueCode, Object payload) {
+        broadcastCounter.increment();
         try {
             String json = objectMapper.writeValueAsString(payload);
             TextMessage message = new TextMessage(json);

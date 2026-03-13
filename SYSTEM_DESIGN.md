@@ -156,6 +156,9 @@ A real-time soccer dashboard that streams live scores, standings, and fixtures f
 | **Managed Cache** | AWS ElastiCache Redis (cache.t3.micro) | Same Redis 7 as local dev, but managed — automatic failover, patching, monitoring via CloudWatch. |
 | **Container Registry** | AWS ECR | Private Docker image registry in the same region as ECS. Eliminates Docker Hub rate limits. |
 | **Logs** | AWS CloudWatch | Centralized log aggregation from ECS containers. Searchable, alertable. |
+| **Observability** | Datadog (APM, RUM, Logs, Metrics) | Full-stack observability: distributed tracing, real user monitoring, structured logging with trace correlation, custom StatsD metrics. |
+| **Metrics** | Micrometer + StatsD | Vendor-neutral metrics facade. StatsD registry pushes to Datadog Agent. Custom gauges for circuit breakers, rate limiters, WebSocket sessions. |
+| **Structured Logging** | logstash-logback-encoder 7.4 | JSON log output in production with `dd.trace_id` and `dd.span_id` for log-to-trace correlation in Datadog. |
 
 **Why not:**
 - **Node.js backend?** — Java matches my resume and demonstrates strong typing, Spring ecosystem knowledge.
@@ -924,6 +927,87 @@ MSYS_NO_PATHCONV=1 aws logs create-log-group --log-group-name /ecs/soccer-dashbo
 
 **Lesson:** Long-lived HTTP connections (SSE, WebSocket, long-polling) require load balancer timeout configuration. The default 60s is designed for request/response patterns.
 
+### 12. Correlating Frontend Latency with Backend Traces
+
+**Problem:** Users reported "slow page loads" but backend APM showed fast responses. No way to see what the browser was actually experiencing — network latency, JS execution time, and resource loading were invisible.
+
+**Fix:** Added Datadog RUM (`@datadog/browser-rum`) with `allowedTracingUrls: [/\/api\//]`. RUM injects `x-datadog-trace-id` headers into API calls, connecting browser sessions to backend APM traces. Now a slow user experience can be traced from the browser → through CloudFront → to the exact backend span that caused the delay.
+
+**Lesson:** Backend APM alone gives you half the picture. RUM with trace linking provides the full request lifecycle from user click to database query.
+
+### 13. Monitoring Circuit Breaker State Drift Silently
+
+**Problem:** Circuit breakers would silently transition to OPEN state during off-peak hours. The System Design Panel only shows state when someone is watching it. No historical record or alerting.
+
+**Fix:** Registered Micrometer gauges for circuit breaker state (0=CLOSED, 1=HALF_OPEN, 2=OPEN) and failure counts via `DatadogMetricsConfig`. These are pushed to Datadog via StatsD every flush interval. A Datadog monitor can alert when `circuit_breaker.state > 0` for more than 2 minutes.
+
+**Lesson:** Resilience patterns need observability too. A circuit breaker that silently fails is worse than no circuit breaker — it masks the problem.
+
+### 14. LLM Cost Visibility Across 3 AI Services
+
+**Problem:** Three services call Claude API (InsightService, NewsService, NarratorService) but there was no aggregate view of token consumption. Cost surprises are possible if caching fails or a service loops.
+
+**Fix:** Added Micrometer counters (`llm.tokens`) tagged by `direction` (input/output), `model`, and `operation`. Each service increments counters after every API call. A Datadog dashboard can show daily token burn rate per operation, and alerts can fire if hourly token usage exceeds a threshold.
+
+**Lesson:** When using paid APIs (especially LLMs), instrument cost metrics from day one. Cache hit rates and token counters together tell you exactly how much each feature costs to operate.
+
+---
+
+## Observability & Monitoring
+
+### Architecture
+
+The Datadog Agent runs as a sidecar container in Docker Compose, receiving data from all services:
+
+```
+┌─────────────┐     ┌─────────────┐     ┌──────────────┐
+│  Frontend   │────▶│  Datadog    │     │   Datadog    │
+│  (RUM SDK)  │     │   Intake    │◀────│   Agent      │
+└─────────────┘     └─────────────┘     └──────┬───────┘
+                                               │
+                          ┌────────────────────┤
+                          │                    │
+                    ┌─────┴─────┐        ┌─────┴─────┐
+                    │  Backend  │        │  MySQL /   │
+                    │ (dd-java- │        │  Redis     │
+                    │  agent)   │        │ (integr.)  │
+                    └───────────┘        └───────────┘
+```
+
+### Four Pillars of Observability
+
+| Pillar | Technology | What it captures |
+|--------|-----------|------------------|
+| **APM (Traces)** | dd-java-agent (auto-instrumentation) | Every HTTP request, JPA query, Redis command, RestTemplate call. Zero code changes. |
+| **Metrics** | Micrometer → StatsD → Datadog Agent | Circuit breaker state, rate limiter quota, cache hit/miss ratios, LLM token usage, WebSocket sessions, SSE clients, poll cycle duration. |
+| **Logs** | logstash-logback-encoder → stdout → DD Agent | JSON-structured logs with `dd.trace_id` and `dd.span_id`. Click from any log line → APM trace. |
+| **RUM** | @datadog/browser-rum | Page load times, user interactions, JS errors, resource loading. `allowedTracingUrls` connects frontend sessions to backend APM traces. |
+
+### Custom Metrics Inventory
+
+| Metric | Type | Tags | Source |
+|--------|------|------|--------|
+| `circuit_breaker.state` | Gauge | name | DatadogMetricsConfig |
+| `circuit_breaker.failure_count` | Gauge | name | DatadogMetricsConfig |
+| `rate_limiter.remaining_quota` | Gauge | name | DatadogMetricsConfig |
+| `rate_limiter.used_quota` | Gauge | name | DatadogMetricsConfig |
+| `rate_limiter.rejections` | Counter | name | FootballDataService |
+| `cache.operations` | Counter | operation (hit/miss), key_pattern | LiveScoreAggregator, SearchService, NewsService |
+| `external_api.latency` | Timer | service | FootballDataService |
+| `llm.tokens` | Counter | direction (input/output), model, operation | InsightService, NewsService, NarratorService |
+| `websocket.active_sessions` | Gauge | — | DatadogMetricsConfig |
+| `websocket.broadcasts` | Counter | — | WebSocketBroadcaster |
+| `sse.active_clients` | Gauge | — | DatadogMetricsConfig |
+| `polling.cycle_duration` | Timer | — | PollingScheduler |
+| `polling.data_diff_count` | Counter | — | PollingScheduler |
+
+### Trace Correlation
+
+The dd-java-agent automatically injects `dd.trace_id` and `dd.span_id` into the SLF4J MDC. The logback-spring.xml configuration includes these in log output. In Datadog:
+- **Logs → Traces:** Click any log line with a trace ID to jump to the full APM trace
+- **RUM → Traces:** Frontend RUM sessions include `allowedTracingUrls` for `/api/` routes, injecting trace context headers. Click a RUM resource to see the backend trace
+- **Traces → Logs:** APM trace view shows correlated logs inline
+
 ---
 
 ## Scalability Considerations
@@ -1012,10 +1096,21 @@ Lambda has a 15-minute execution limit and cold starts — incompatible with lon
 
 CloudFront natively supports WebSocket — when it receives a request with `Upgrade: websocket` header, it forwards it to the origin (ALB) and establishes a persistent connection. I added a `/ws/*` cache behavior in CloudFront that forwards all headers to the ALB. This way, both REST API and WebSocket use the same HTTPS CloudFront domain, avoiding mixed-content browser security errors.
 
+### "How did you implement observability for this project?"
+
+Four pillars through Datadog: (1) **APM** via dd-java-agent — zero-code auto-instrumentation that traces every Spring MVC request, JPA query, Redis command, and RestTemplate call. (2) **Custom metrics** via Micrometer with a StatsD registry — circuit breaker state, rate limiter quota, cache hit/miss ratios, LLM token consumption, and WebSocket session counts. (3) **Structured logging** with logstash-logback-encoder — JSON logs in production with `dd.trace_id` for log-to-trace correlation. (4) **RUM** via @datadog/browser-rum — page load times, user interactions, and frontend-to-backend trace linking via `allowedTracingUrls`.
+
+### "How do you correlate a slow user experience to a backend issue?"
+
+Datadog RUM captures the frontend request. Because `allowedTracingUrls` is configured for `/api/` routes, RUM injects trace context headers into every API call. I can click a slow RUM resource and jump directly to the backend APM trace showing the exact Spring controller, Redis cache lookup, and external API call that caused the latency. If the backend was fast but the user still experienced slowness, RUM shows whether it was network, JS execution, or resource loading.
+
+### "How do you monitor LLM costs across your AI features?"
+
+Each of the three AI services (InsightService, NewsService, NarratorService) increments Micrometer counters tagged by `direction` (input/output), `model`, and `operation` after every Claude API call. These flow through StatsD to Datadog, where I can build dashboards showing daily token burn rate per operation. Combined with cache hit rate metrics, I can see that 95% of insight requests are served from cache, so the actual LLM cost is one API call per league per hour rather than per user request.
+
 ### "What would you do differently if starting over?"
 
 - **Use WebClient instead of RestTemplate** for non-blocking HTTP calls. RestTemplate is synchronous and blocks a thread per request.
-- **Add structured logging** (e.g., MDC with trace IDs) for correlation between System Design Panel events and server logs.
 - **TypeScript on the frontend** for better type safety across the many component props.
 - **Integration tests** with Testcontainers for Redis and MySQL.
 - **OpenAPI/Swagger** for API documentation.
