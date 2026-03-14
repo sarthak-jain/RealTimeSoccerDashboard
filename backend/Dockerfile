@@ -8,6 +8,6 @@ RUN apt-get update && apt-get install -y maven && \
 FROM eclipse-temurin:21-jre
 WORKDIR /app
 COPY --from=build /app/target/*.jar app.jar
-ADD https://dtdg.co/latest-java-tracer /app/dd-java-agent.jar
+RUN curl -Lo /app/dd-java-agent.jar https://dtdg.co/latest-java-tracer && chmod 644 /app/dd-java-agent.jar
 EXPOSE 8080
-ENTRYPOINT ["java", "-javaagent:/app/dd-java-agent.jar", "-Xmx768m", "-jar", "-Dspring.profiles.active=prod", "app.jar"]
+ENTRYPOINT ["java", "-javaagent:/app/dd-java-agent.jar", "-Dspring.profiles.active=prod", "-Xmx768m", "-jar", "app.jar"]

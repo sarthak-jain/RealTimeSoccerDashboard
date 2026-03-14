@@ -15,10 +15,11 @@
 12. [API Design](#api-design)
 13. [Database Schema](#database-schema)
 14. [Production Deployment (AWS)](#production-deployment-aws)
-15. [Special Features](#special-features)
-16. [Challenges & Solutions](#challenges--solutions)
-17. [Scalability Considerations](#scalability-considerations)
-18. [Interview Q&A](#interview-qa)
+15. [Datadog Observability (Full-Stack)](#datadog-observability-full-stack)
+16. [Special Features](#special-features)
+17. [Challenges & Solutions](#challenges--solutions)
+18. [Scalability Considerations](#scalability-considerations)
+19. [Interview Q&A](#interview-qa)
 
 ---
 
@@ -713,12 +714,13 @@ RUN apt-get update && apt-get install -y maven && \
 FROM eclipse-temurin:21-jre
 WORKDIR /app
 COPY --from=build /app/target/*.jar app.jar
+RUN curl -Lo /app/dd-java-agent.jar https://dtdg.co/latest-java-tracer && chmod 644 /app/dd-java-agent.jar
 EXPOSE 8080
-ENTRYPOINT ["java", "-Xmx768m", "-jar", "-Dspring.profiles.active=prod", "app.jar"]
+ENTRYPOINT ["java", "-javaagent:/app/dd-java-agent.jar", "-Dspring.profiles.active=prod", "-Xmx768m", "-jar", "app.jar"]
 ```
 
 **Stage 1 (build):** Full JDK + Maven to compile. ~800MB.
-**Stage 2 (runtime):** JRE only + JAR file. ~150MB. No build tools, source code, or dependencies in production image.
+**Stage 2 (runtime):** JRE only + JAR + dd-java-agent. ~160MB. The Datadog Java agent is downloaded at build time and attached as a `-javaagent` JVM argument for zero-code APM instrumentation.
 
 ### Environment Configuration
 
@@ -734,6 +736,13 @@ Production uses `application-prod.yml` with all secrets injected via environment
 | `GNEWS_API_KEY` | ECS env | News API auth |
 | `CLAUDE_API_KEY` | ECS env | AI/LLM auth |
 | `CORS_ORIGINS` | ECS env (`*`) | Allowed CORS origins |
+| `DD_AGENT_HOST` | ECS env (`localhost`) | Datadog agent address (localhost for Fargate sidecar) |
+| `DD_SERVICE` | ECS env | Service name for APM/logs (`soccer-dashboard-backend`) |
+| `DD_ENV` | ECS env | Environment tag (`prod`) |
+| `DD_VERSION` | ECS env | Version tag (`1.0.0`) |
+| `DD_LOGS_INJECTION` | ECS env | Inject trace_id/span_id into logs (`true`) |
+| `DD_API_KEY` | ECS env (agent container) | Datadog API key for agent authentication |
+| `DD_SITE` | ECS env (agent container) | Datadog site (`us5.datadoghq.com`) |
 
 No secrets in code or Docker images. All configuration is environment-driven.
 
@@ -951,43 +960,169 @@ MSYS_NO_PATHCONV=1 aws logs create-log-group --log-group-name /ecs/soccer-dashbo
 
 **Lesson:** When using paid APIs (especially LLMs), instrument cost metrics from day one. Cache hit rates and token counters together tell you exactly how much each feature costs to operate.
 
+### 15. Datadog Agent Not Receiving Traces in ECS Fargate
+
+**Problem:** After deploying the Datadog agent as a sidecar container in ECS Fargate, the Datadog portal showed the containers in Infrastructure → Containers but APM → Services was empty. No traces were being received despite the backend having `dd-java-agent.jar` configured.
+
+**Root cause:** Three issues compounding:
+1. **Wrong `DD_SITE`:** The Datadog account was on `us5.datadoghq.com` but the agent defaulted to `datadoghq.com` (US1). All data was being sent to the wrong Datadog site.
+2. **`DD_AGENT_HOST` set to `datadog-agent` instead of `localhost`:** In Docker Compose, the agent is a separate service reachable by container name. In ECS Fargate, sidecar containers share the same network namespace — the agent is at `localhost`.
+3. **Dockerfile `-javaagent` issues:** The `ADD` instruction for downloading `dd-java-agent.jar` could silently fail. JVM system properties (`-Dspring.profiles.active=prod`) were placed after `-jar`, where they're treated as application arguments, not JVM flags.
+
+**Fix:**
+1. Added `DD_SITE=us5.datadoghq.com` to the datadog-agent container environment
+2. Changed `DD_AGENT_HOST` from `datadog-agent` to `localhost` on the backend container
+3. Replaced `ADD https://dtdg.co/latest-java-tracer` with `RUN curl -Lo dd-java-agent.jar` for reliable download
+4. Reordered Dockerfile ENTRYPOINT: `-javaagent` and `-D` flags before `-jar`
+
+**Lesson:** When moving from Docker Compose to ECS Fargate, networking changes fundamentally. Services reachable by container name in Compose become `localhost` in Fargate sidecars. Always verify the Datadog site matches your account region. And in Dockerfiles, use `RUN curl` over `ADD` for external URLs — `ADD` failures are silent and harder to debug.
+
+### 16. Dockerfile JVM Argument Ordering
+
+**Problem:** The Dockerfile ENTRYPOINT was `["java", "-javaagent:...", "-Xmx768m", "-jar", "-Dspring.profiles.active=prod", "app.jar"]`. The `-Dspring.profiles.active=prod` flag was placed after `-jar`, so the JVM treated it as an argument passed to the application's `main()` method rather than as a JVM system property.
+
+**Fix:** Moved all JVM flags before `-jar`: `["java", "-javaagent:...", "-Dspring.profiles.active=prod", "-Xmx768m", "-jar", "app.jar"]`
+
+**Lesson:** In `java -jar` commands, everything after `-jar app.jar` is passed to the application, not to the JVM. All `-D`, `-X`, and `-javaagent` flags must come before `-jar`.
+
 ---
 
-## Observability & Monitoring
+## Datadog Observability (Full-Stack)
+
+### Why Datadog
+
+The System Design Panel provides live, in-browser observability — but only while someone is watching. Datadog adds persistent, historical, alertable observability across all four pillars: traces, metrics, logs, and real user monitoring. Together, the System Design Panel shows *how the system works* and Datadog shows *how the system performs*.
 
 ### Architecture
 
-The Datadog Agent runs as a sidecar container in Docker Compose, receiving data from all services:
+#### Local Development (Docker Compose)
+
+The Datadog Agent runs as a standalone container in `docker-compose.yml`, collecting data from all services via Docker socket and network:
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌──────────────┐
-│  Frontend   │────▶│  Datadog    │     │   Datadog    │
-│  (RUM SDK)  │     │   Intake    │◀────│   Agent      │
-└─────────────┘     └─────────────┘     └──────┬───────┘
-                                               │
-                          ┌────────────────────┤
-                          │                    │
-                    ┌─────┴─────┐        ┌─────┴─────┐
-                    │  Backend  │        │  MySQL /   │
-                    │ (dd-java- │        │  Redis     │
-                    │  agent)   │        │ (integr.)  │
-                    └───────────┘        └───────────┘
+┌─────────────┐     ┌──────────────────┐     ┌──────────────┐
+│  Frontend   │────▶│  Datadog Intake   │     │  Datadog     │
+│  (RUM SDK)  │     │  (us5.datadoghq)  │◀────│  Agent       │
+└─────────────┘     └──────────────────┘     └──────┬───────┘
+                                                     │
+                              ┌──────────────────────┤
+                              │                      │
+                        ┌─────┴─────┐          ┌─────┴─────┐
+                        │  Backend  │          │  MySQL /   │
+                        │ (dd-java- │          │  Redis     │
+                        │  agent)   │          │ (integr.)  │
+                        └───────────┘          └───────────┘
 ```
+
+#### Production (ECS Fargate)
+
+The Datadog Agent runs as a **sidecar container** in the same ECS task definition. Sidecar containers share the same network namespace in Fargate, so the backend communicates with the agent via `localhost`:
+
+```
+┌─── ECS Fargate Task ──────────────────────────────────┐
+│                                                        │
+│  ┌──────────────┐    localhost:8126    ┌─────────────┐ │
+│  │   backend    │ ──── traces ──────▶ │  datadog-   │ │
+│  │  (dd-java-   │    localhost:8125    │   agent     │ │
+│  │   agent.jar) │ ──── metrics ─────▶ │             │──────▶ Datadog Intake
+│  │              │    stdout           │             │ │      (us5.datadoghq.com)
+│  │              │ ──── logs ────────▶ │             │ │
+│  └──────────────┘                     └─────────────┘ │
+│                                                        │
+└────────────────────────────────────────────────────────┘
+
+┌──────────────┐
+│  Frontend    │ ──── RUM events ──────▶ Datadog Intake (direct)
+│  (CloudFront)│
+└──────────────┘
+```
+
+**Key difference between local and production:** In Docker Compose, the agent is a separate service (`DD_AGENT_HOST=datadog-agent`). In ECS Fargate, it's a sidecar (`DD_AGENT_HOST=localhost`). The `application-prod.yml` defaults to `localhost` for production.
 
 ### Four Pillars of Observability
 
-| Pillar | Technology | What it captures |
-|--------|-----------|------------------|
-| **APM (Traces)** | dd-java-agent (auto-instrumentation) | Every HTTP request, JPA query, Redis command, RestTemplate call. Zero code changes. |
-| **Metrics** | Micrometer → StatsD → Datadog Agent | Circuit breaker state, rate limiter quota, cache hit/miss ratios, LLM token usage, WebSocket sessions, SSE clients, poll cycle duration. |
-| **Logs** | logstash-logback-encoder → stdout → DD Agent | JSON-structured logs with `dd.trace_id` and `dd.span_id`. Click from any log line → APM trace. |
-| **RUM** | @datadog/browser-rum | Page load times, user interactions, JS errors, resource loading. `allowedTracingUrls` connects frontend sessions to backend APM traces. |
+| Pillar | Technology | What It Captures | Code Changes Required |
+|--------|-----------|------------------|----------------------|
+| **APM (Traces)** | dd-java-agent (auto-instrumentation) | Every HTTP request, JPA query, Redis command, RestTemplate call | Zero — agent attached via `-javaagent` JVM flag |
+| **Metrics** | Micrometer → StatsD → Datadog Agent | Circuit breaker state, rate limiter quota, cache hit/miss, LLM tokens, WebSocket sessions, SSE clients, poll duration | `DatadogMetricsConfig.java` + counters in services |
+| **Logs** | logstash-logback-encoder → stdout → DD Agent | JSON-structured logs with `dd.trace_id` and `dd.span_id` | `logback-spring.xml` + `logstash-logback-encoder` dependency |
+| **RUM** | @datadog/browser-rum | Page load times, user interactions, JS errors, resource loading, frontend-to-backend trace linking | `main.jsx` + `@datadog/browser-rum` npm package |
+
+### What Datadog Gives Us
+
+With all four pillars connected, Datadog provides:
+
+1. **APM Service Map** — auto-discovered topology showing `soccer-dashboard-backend` → MySQL → Redis → Football-Data.org. No manual configuration.
+2. **Request Traces** — every API request traced end-to-end: Spring MVC controller → JPA/Hibernate queries → Redis cache reads → external HTTP calls to Football-Data.org and Claude API. Each trace shows latency breakdown by component.
+3. **Error Tracking** — exceptions captured with full stack traces, grouped by type, with affected trace context.
+4. **Log-Trace Correlation** — click any log line with `dd.trace_id` to jump to the full APM trace. Click any trace to see inline logs. No manual searching.
+5. **Frontend-to-Backend Correlation** — RUM captures browser experience (page load, API call timing, JS errors). `allowedTracingUrls` injects trace headers into `/api/` calls, linking frontend sessions to backend traces. A "slow page" complaint can be traced from browser → CloudFront → ALB → Spring controller → database query.
+6. **Custom Business Metrics** — circuit breaker state, API quota remaining, LLM token burn rate, cache hit ratios. These go beyond infrastructure metrics to track application-level health.
+7. **Infrastructure Monitoring** — container CPU, memory, network I/O for both backend and agent containers via ECS Fargate integration.
+8. **Alerting** — Datadog monitors can fire when circuit breaker state > 0 for 2+ minutes, API quota drops below threshold, error rate spikes, or LLM token usage exceeds budget.
+
+### Integration — Code Changes Made
+
+#### Backend (Java/Spring Boot)
+
+| File | What Was Added | Purpose |
+|------|---------------|---------|
+| `pom.xml` | `micrometer-registry-statsd` dependency | Push metrics via StatsD protocol to Datadog Agent |
+| `pom.xml` | `logstash-logback-encoder` dependency | JSON-structured logging with trace context |
+| `Dockerfile` | `curl -Lo dd-java-agent.jar` + `-javaagent` flag | APM auto-instrumentation at JVM level |
+| `application.yml` | `management.metrics.export.statsd.*` config | Configure StatsD host/port/flavor for Datadog |
+| `application-prod.yml` | Same, with `DD_AGENT_HOST` variable | Production StatsD endpoint (localhost in Fargate) |
+| `logback-spring.xml` | Two profiles: human-readable (dev) + JSON (prod) | Dev shows `[dd.trace_id=... dd.span_id=...]` inline; prod emits JSON with MDC fields for Datadog log pipeline |
+| `DatadogMetricsConfig.java` | Micrometer gauge/counter registrations | Custom metrics: circuit breaker state, rate limiter quota, WebSocket sessions, SSE clients |
+| `FootballDataService.java` | `meterRegistry.counter/timer` calls | API latency timer, rate limiter rejection counter, cache operation counters |
+| `LiveScoreAggregator.java` | `meterRegistry.counter` calls | Cache hit/miss counters for live score data |
+| `SearchService.java` | `meterRegistry.counter` calls | Cache hit/miss counters for team search |
+| `NewsService.java` | `meterRegistry.counter` calls | Cache hit/miss counters for news, LLM token counters |
+| `InsightService.java` | `meterRegistry.counter` calls | LLM token counters (input/output by operation) |
+| `NarratorService.java` | `meterRegistry.counter` calls | LLM token counters for panel narration |
+| `PollingScheduler.java` | `meterRegistry.timer/counter` calls | Poll cycle duration, data diff count |
+| `WebSocketBroadcaster.java` | `meterRegistry.counter` calls | WebSocket broadcast count |
+
+#### Frontend (React)
+
+| File | What Was Added | Purpose |
+|------|---------------|---------|
+| `package.json` | `@datadog/browser-rum` dependency | Datadog RUM SDK |
+| `main.jsx` | `datadogRum.init({...})` | Initialize RUM with app ID, client token, `allowedTracingUrls` for trace linking |
+| `.env.example` | `VITE_DD_APPLICATION_ID`, `VITE_DD_CLIENT_TOKEN`, `VITE_DD_SITE` | RUM configuration via environment variables |
+
+#### Infrastructure
+
+| File | What Was Added | Purpose |
+|------|---------------|---------|
+| `docker-compose.yml` | `datadog-agent` service with DD env vars | Local Datadog Agent container |
+| `docker-compose.yml` | Docker labels on mysql/redis/backend/frontend | Auto-discovery for Datadog integrations |
+| `datadog/conf.d/mysql.d/conf.yaml` | MySQL integration config | Monitor MySQL metrics (connections, queries, replication) |
+| `datadog/conf.d/redis.d/conf.yaml` | Redis integration config | Monitor Redis metrics (memory, commands, keyspace) |
+| `data/init-datadog-user.sql` | `CREATE USER 'datadog'@'%'` | Dedicated MySQL user with SELECT, PROCESS, REPLICATION CLIENT grants |
+
+#### ECS Task Definition (AWS Console — not in code)
+
+| Container | Environment Variable | Value | Purpose |
+|-----------|---------------------|-------|---------|
+| `backend` | `DD_AGENT_HOST` | `localhost` | Agent sidecar address |
+| `backend` | `DD_SERVICE` | `soccer-dashboard-backend` | Unified service tagging |
+| `backend` | `DD_ENV` | `prod` | Environment tag |
+| `backend` | `DD_VERSION` | `1.0.0` | Version tag |
+| `backend` | `DD_LOGS_INJECTION` | `true` | Inject trace IDs into logs |
+| `datadog-agent` | `DD_API_KEY` | `(secret)` | Agent authentication |
+| `datadog-agent` | `DD_SITE` | `us5.datadoghq.com` | Datadog intake site |
+| `datadog-agent` | `DD_APM_ENABLED` | `true` | Enable trace collection |
+| `datadog-agent` | `DD_APM_NON_LOCAL_TRAFFIC` | `true` | Accept traces from other containers |
+| `datadog-agent` | `DD_LOGS_ENABLED` | `true` | Enable log collection |
+| `datadog-agent` | `ECS_FARGATE` | `true` | Fargate-specific optimizations |
+| `datadog-agent` | Port mappings | `8126/tcp`, `8125/udp` | APM traces + StatsD metrics |
 
 ### Custom Metrics Inventory
 
 | Metric | Type | Tags | Source |
 |--------|------|------|--------|
-| `circuit_breaker.state` | Gauge | name | DatadogMetricsConfig |
+| `circuit_breaker.state` | Gauge | name (matches/json) | DatadogMetricsConfig |
 | `circuit_breaker.failure_count` | Gauge | name | DatadogMetricsConfig |
 | `rate_limiter.remaining_quota` | Gauge | name | DatadogMetricsConfig |
 | `rate_limiter.used_quota` | Gauge | name | DatadogMetricsConfig |
@@ -1001,12 +1136,45 @@ The Datadog Agent runs as a sidecar container in Docker Compose, receiving data 
 | `polling.cycle_duration` | Timer | — | PollingScheduler |
 | `polling.data_diff_count` | Counter | — | PollingScheduler |
 
-### Trace Correlation
+### Trace Correlation (How the Pillars Connect)
 
-The dd-java-agent automatically injects `dd.trace_id` and `dd.span_id` into the SLF4J MDC. The logback-spring.xml configuration includes these in log output. In Datadog:
+The dd-java-agent automatically injects `dd.trace_id` and `dd.span_id` into the SLF4J MDC. The `logback-spring.xml` configuration includes these fields in log output. This creates three-way correlation:
+
 - **Logs → Traces:** Click any log line with a trace ID to jump to the full APM trace
-- **RUM → Traces:** Frontend RUM sessions include `allowedTracingUrls` for `/api/` routes, injecting trace context headers. Click a RUM resource to see the backend trace
+- **RUM → Traces:** Frontend RUM sessions include `allowedTracingUrls` for `/api/` routes, injecting `x-datadog-trace-id` headers. Click a RUM resource to see the backend trace
 - **Traces → Logs:** APM trace view shows correlated logs inline
+- **Metrics → Traces:** Spike in `circuit_breaker.state` or `rate_limiter.rejections` can be correlated with traces from the same time window
+
+### Structured Logging Configuration
+
+```xml
+<!-- Dev: human-readable with trace IDs -->
+<pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36}
+  - [dd.trace_id=%X{dd.trace_id} dd.span_id=%X{dd.span_id}] %msg%n</pattern>
+
+<!-- Prod: JSON for Datadog log pipeline -->
+<encoder class="net.logstash.logback.encoder.LogstashEncoder">
+    <includeMdcKeyName>dd.trace_id</includeMdcKeyName>
+    <includeMdcKeyName>dd.span_id</includeMdcKeyName>
+    <includeMdcKeyName>dd.service</includeMdcKeyName>
+    <includeMdcKeyName>dd.env</includeMdcKeyName>
+    <includeMdcKeyName>dd.version</includeMdcKeyName>
+</encoder>
+```
+
+Dev logs are readable in the terminal. Prod logs are JSON — Datadog's log pipeline parses them automatically, extracts trace IDs, and links to APM.
+
+### Datadog Portal (us5.datadoghq.com)
+
+| Section | What to Look For |
+|---------|-----------------|
+| **APM → Services** | `soccer-dashboard-backend` with request rate, error rate, latency percentiles |
+| **APM → Traces** | Individual request traces with span waterfall (controller → cache → API → DB) |
+| **APM → Service Map** | Auto-discovered topology: backend → MySQL, Redis, Football-Data.org, Claude API |
+| **Infrastructure → Containers** | ECS Fargate containers with CPU, memory, network metrics |
+| **Logs → Search** | JSON logs filterable by `service:soccer-dashboard-backend`, `@dd.trace_id` |
+| **RUM → Sessions** | Frontend user sessions with page loads, API calls, errors |
+| **Metrics → Explorer** | Custom metrics: `circuit_breaker.state`, `rate_limiter.*`, `llm.tokens`, etc. |
 
 ---
 
@@ -1098,7 +1266,7 @@ CloudFront natively supports WebSocket — when it receives a request with `Upgr
 
 ### "How did you implement observability for this project?"
 
-Four pillars through Datadog: (1) **APM** via dd-java-agent — zero-code auto-instrumentation that traces every Spring MVC request, JPA query, Redis command, and RestTemplate call. (2) **Custom metrics** via Micrometer with a StatsD registry — circuit breaker state, rate limiter quota, cache hit/miss ratios, LLM token consumption, and WebSocket session counts. (3) **Structured logging** with logstash-logback-encoder — JSON logs in production with `dd.trace_id` for log-to-trace correlation. (4) **RUM** via @datadog/browser-rum — page load times, user interactions, and frontend-to-backend trace linking via `allowedTracingUrls`.
+Four pillars through Datadog: (1) **APM** via dd-java-agent — zero-code auto-instrumentation that traces every Spring MVC request, JPA query, Redis command, and RestTemplate call. The agent JAR is downloaded at Docker build time and attached via `-javaagent` JVM flag. (2) **Custom metrics** via Micrometer with a StatsD registry — circuit breaker state, rate limiter quota, cache hit/miss ratios, LLM token consumption, and WebSocket session counts. These are pushed to the Datadog Agent over UDP port 8125. (3) **Structured logging** with logstash-logback-encoder — JSON logs in production with `dd.trace_id` for log-to-trace correlation. Dev uses human-readable format with the same trace IDs inline. (4) **RUM** via @datadog/browser-rum — page load times, user interactions, and frontend-to-backend trace linking via `allowedTracingUrls`. In production, the Datadog Agent runs as a sidecar container in the same ECS Fargate task, communicating via `localhost`.
 
 ### "How do you correlate a slow user experience to a backend issue?"
 
@@ -1107,6 +1275,14 @@ Datadog RUM captures the frontend request. Because `allowedTracingUrls` is confi
 ### "How do you monitor LLM costs across your AI features?"
 
 Each of the three AI services (InsightService, NewsService, NarratorService) increments Micrometer counters tagged by `direction` (input/output), `model`, and `operation` after every Claude API call. These flow through StatsD to Datadog, where I can build dashboards showing daily token burn rate per operation. Combined with cache hit rate metrics, I can see that 95% of insight requests are served from cache, so the actual LLM cost is one API call per league per hour rather than per user request.
+
+### "How did you debug the Datadog agent not receiving traces in production?"
+
+The infrastructure showed both containers running and Datadog saw them in Infrastructure → Containers, but APM → Services was empty. I debugged it layer by layer: (1) Confirmed port mappings (8126/tcp, 8125/udp) were correct on the agent container. (2) Checked backend container logs for the dd-java-agent startup banner — it wasn't appearing, which pointed to a Dockerfile issue. (3) Discovered the agent was sending data to `datadoghq.com` (US1) while our account was on `us5.datadoghq.com` — the `DD_SITE` environment variable was missing. (4) Fixed `DD_AGENT_HOST` from `datadog-agent` (Docker Compose hostname) to `localhost` (Fargate sidecar networking). (5) Fixed the Dockerfile: replaced `ADD` with `RUN curl` for reliable JAR download, and reordered JVM flags so `-javaagent` and `-D` properties came before `-jar`. After rebuilding the image and redeploying, traces appeared within 2 minutes.
+
+### "What's the difference between your System Design Panel and Datadog?"
+
+They serve different purposes. The System Design Panel is a **live, in-browser visualization** that shows how backend operations flow in real-time — it's designed for demonstrations and teaching system design concepts. You can watch a request flow from gateway → cache check → rate limiter → API call → cache write → response. Datadog is **persistent, historical, and alertable** — it stores weeks of traces, aggregates metrics over time, correlates logs with traces, and can page someone at 3am when the circuit breaker opens. The System Design Panel answers "how does this system work?" while Datadog answers "how is this system performing?"
 
 ### "What would you do differently if starting over?"
 

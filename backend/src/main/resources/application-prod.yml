@@ -38,6 +38,6 @@ management:
     export:
       statsd:
         enabled: true
-        host: ${DD_AGENT_HOST:datadog-agent}
+        host: ${DD_AGENT_HOST:localhost}
         port: 8125
         flavor: datadog
