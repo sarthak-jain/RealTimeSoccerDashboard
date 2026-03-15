@@ -19,7 +19,6 @@
 16. [Special Features](#special-features)
 17. [Challenges & Solutions](#challenges--solutions)
 18. [Scalability Considerations](#scalability-considerations)
-19. [Interview Q&A](#interview-qa) *(see [INTERVIEW_QA.md](INTERVIEW_QA.md))*
 
 ---
 
@@ -1253,8 +1252,3 @@ Deployed on AWS ECS Fargate with a single task (0.5 vCPU, 1GB RAM). Works for po
 
 7. **ElastiCache cluster mode:** Shard cache keys across nodes for higher throughput.
 
----
-
-## Interview Q&A
-
-See [INTERVIEW_QA.md](INTERVIEW_QA.md) for the full list of system design interview questions and answers.
