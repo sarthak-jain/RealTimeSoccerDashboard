@@ -19,7 +19,7 @@
 16. [Special Features](#special-features)
 17. [Challenges & Solutions](#challenges--solutions)
 18. [Scalability Considerations](#scalability-considerations)
-19. [Interview Q&A](#interview-qa)
+19. [Interview Q&A](#interview-qa) *(see [INTERVIEW_QA.md](INTERVIEW_QA.md))*
 
 ---
 
@@ -977,7 +977,28 @@ MSYS_NO_PATHCONV=1 aws logs create-log-group --log-group-name /ecs/soccer-dashbo
 
 **Lesson:** When moving from Docker Compose to ECS Fargate, networking changes fundamentally. Services reachable by container name in Compose become `localhost` in Fargate sidecars. Always verify the Datadog site matches your account region. And in Dockerfiles, use `RUN curl` over `ADD` for external URLs — `ADD` failures are silent and harder to debug.
 
-### 16. Dockerfile JVM Argument Ordering
+### 16. Stale Docker Image in ECR — Missing Servlet Traces
+
+**Problem:** After fixing the Fargate networking issues (Challenge #15), the Datadog APM service page only showed `scheduled.call` and `mysql.query` operations. `servlet.request` was completely absent despite HTTP requests successfully reaching the backend and returning data.
+
+**Root cause:** The Docker image in ECR was stale — built before the `dd-java-agent.jar` was added to the Dockerfile. The running ECS task was using the old image without the Java agent. The `mysql.query` traces were misleading because they came from the **Datadog Agent's direct MySQL integration** (autodiscovery), not from the Java agent. The `scheduled.call` traces came from Spring Boot's built-in Micrometer observation support, also not from the Java agent.
+
+**Diagnosis clues:**
+- CloudWatch startup logs showed **no** `DATADOG TRACER CONFIGURATION` block (the dd-java-agent always prints this at startup when loaded)
+- Production logs were in **plain text** format instead of JSON — proving the prod profile's logstash-logback-encoder wasn't active, which further confirmed the image was outdated
+- Only `scheduled.call` and `mysql.query` in the Datadog operation dropdown — no `servlet.request`
+- Everything appeared "green" — containers running, health checks passing, API responses working
+
+**Fix:** Rebuilt the Docker image, pushed to ECR, and forced a new ECS deployment:
+```bash
+docker build --platform linux/amd64 -t <account>.dkr.ecr.us-east-2.amazonaws.com/soccer-dashboard-backend:latest ./backend
+docker push <account>.dkr.ecr.us-east-2.amazonaws.com/soccer-dashboard-backend:latest
+aws ecs update-service --cluster soccer-dashboard-cluster --service soccer-dashboard-service --force-new-deployment
+```
+
+**Lesson:** When debugging missing traces, always verify the deployed image is current. A stale image can produce partial observability (from infrastructure-level integrations) that masks the fact that application-level instrumentation is entirely absent. Check CloudWatch logs for the `DATADOG TRACER CONFIGURATION` block as the first verification step.
+
+### 17. Dockerfile JVM Argument Ordering
 
 **Problem:** The Dockerfile ENTRYPOINT was `["java", "-javaagent:...", "-Xmx768m", "-jar", "-Dspring.profiles.active=prod", "app.jar"]`. The `-Dspring.profiles.active=prod` flag was placed after `-jar`, so the JVM treated it as an argument passed to the application's `main()` method rather than as a JVM system property.
 
@@ -1060,6 +1081,28 @@ With all four pillars connected, Datadog provides:
 6. **Custom Business Metrics** — circuit breaker state, API quota remaining, LLM token burn rate, cache hit ratios. These go beyond infrastructure metrics to track application-level health.
 7. **Infrastructure Monitoring** — container CPU, memory, network I/O for both backend and agent containers via ECS Fargate integration.
 8. **Alerting** — Datadog monitors can fire when circuit breaker state > 0 for 2+ minutes, API quota drops below threshold, error rate spikes, or LLM token usage exceeds budget.
+
+### Expected APM Trace Operations
+
+When the dd-java-agent is correctly loaded, the Datadog APM service page (`soccer-dashboard-backend`) shows three operation types:
+
+| Operation | Source | What Generates It |
+|-----------|--------|-------------------|
+| `servlet.request` | dd-java-agent auto-instrumentation | Any HTTP request to Spring MVC controllers (GET /api/leagues, GET /api/live, etc.) |
+| `scheduled.call` | dd-java-agent auto-instrumentation | `@Scheduled` methods — `PollingScheduler.pollLiveScores` runs every 30s |
+| `mysql.query` | Datadog Agent MySQL integration | Direct MySQL monitoring via autodiscovery (independent of Java agent) |
+
+**Important:** If only `scheduled.call` and `mysql.query` appear but `servlet.request` is missing, the dd-java-agent is likely **not loaded**. See Challenge #16 (Stale Docker Image) for diagnosis steps.
+
+### Post-Deployment Verification Checklist
+
+After deploying a new backend image to ECS, verify observability is working:
+
+1. **CloudWatch Logs:** Confirm the `DATADOG TRACER CONFIGURATION` JSON block appears in startup logs (printed by dd-java-agent before Spring Boot banner)
+2. **Log Format:** Verify logs are in JSON format (e.g., `{"@timestamp":"...","message":"...","dd.service":"soccer-dashboard-backend"}`). Plain text logs indicate the prod profile or logstash-logback-encoder is not active.
+3. **Datadog APM → Services:** The `soccer-dashboard-backend` service should appear with `servlet.request` in the operation dropdown
+4. **Datadog APM → Traces:** After hitting any API endpoint, a trace should appear showing the full request waterfall (controller → cache → database → external API)
+5. **Log-Trace Link:** Click a JSON log entry with `dd.trace_id` — it should link to the corresponding APM trace
 
 ### Integration — Code Changes Made
 
@@ -1214,81 +1257,4 @@ Deployed on AWS ECS Fargate with a single task (0.5 vCPU, 1GB RAM). Works for po
 
 ## Interview Q&A
 
-### "Why did you choose SSE over WebSocket for the System Design Panel?"
-
-SSE is server→client only, which is exactly what the panel needs — the server pushes workflow events, the client never sends messages back. SSE has built-in auto-reconnect via the `EventSource` API, works through HTTP/1.1 proxies without upgrade negotiation, and is simpler server-side (just write to an `SseEmitter`). I used WebSocket for live scores because clients need to send subscription messages (which leagues they're watching).
-
-### "How do you handle the Football-Data.org API going down?"
-
-Three layers: (1) **Circuit breaker** detects consecutive failures and stops calling the API for 60s, preventing cascading timeouts. (2) **Cache** serves stale data — standings cached for 5min, fixtures for 1hr. Even if the API is down, users see recent data. (3) **Demo mode** as a fallback for demonstrations. The circuit breaker state is visible in the System Design Panel and can be manually reset via an admin endpoint.
-
-### "What happens if Redis goes down?"
-
-The app degrades gracefully. Cache reads catch exceptions and fall through to the API call. Cache writes catch exceptions and log warnings. The only impact is higher latency (every request hits the external API) and increased API quota usage. MySQL handles the critical persistent data (users, favorites).
-
-### "How do you prevent the 10 req/min API limit from being exhausted?"
-
-The sliding-window rate limiter tracks requests per 60-second window. The polling scheduler checks remaining quota before each cycle and skips if exhausted. Rate limiting is checked BEFORE the circuit breaker to avoid conflating policy decisions with failure detection. Remaining quota is displayed in the System Design Panel so I can monitor it in real-time.
-
-### "Why cache AI insights for 1 hour?"
-
-League standings don't change dramatically within an hour. The AI analysis covers trends (title race, relegation battle) that are valid for hours. Caching for 1hr means each league's insight costs one API call per hour regardless of how many users request it. The cache key includes the league code, so different leagues get independent caches.
-
-### "How does the data diff engine work?"
-
-It compares the previous cached match list against the fresh API response. It checks three dimensions: score changes (goals), status changes (kickoff, halftime, full-time), and new events (cards, substitutions). Only the delta is broadcast via WebSocket, not the full match list. This reduces bandwidth and allows the frontend to animate specific changes (score flash effect).
-
-### "Walk me through what happens when a user opens the dashboard."
-
-1. React app loads, connects to SSE endpoint (`/api/workflow/stream`) and WebSocket (`/ws/live`)
-2. User selects Premier League → `GET /api/leagues/PL/standings`
-3. Backend checks Redis (cache miss on first load), calls Football-Data.org, caches result, returns JSON
-4. System Design Panel shows the full trace: Gateway → Cache MISS → Rate Check → API Call (340ms) → Cache Write → Response
-5. WebSocket sends subscription for PL. If a polling cycle detects a score change, the client gets a push update
-6. User clicks AI Analysis → `GET /api/insights/PL` → Claude Haiku generates analysis → cached for 1hr
-7. Second user loads same league → all cache HITs → sub-5ms response
-
-### "How did you deploy this to production?"
-
-The backend runs as a Docker container on **ECS Fargate** — serverless containers, no EC2 instances to manage. It sits behind an **ALB** (Application Load Balancer) with a 3600s idle timeout for SSE/WebSocket. **RDS MySQL** and **ElastiCache Redis** provide managed database and cache. The React frontend is a static build deployed to **S3** behind **CloudFront** for HTTPS and CDN caching. CloudFront routes `/api/*` and `/ws/*` to the ALB, so everything goes through a single HTTPS domain. All secrets are injected via ECS task definition environment variables — nothing in code or Docker images.
-
-### "How does this project handle streams of data?"
-
-Three independent streams: (1) **Live scores via WebSocket** — the backend polls Football-Data.org every 30s, diffs against cached data, and pushes only the changes to subscribed clients. This is a server-initiated push stream with selective fan-out. (2) **System Design Panel via SSE** — an append-only event stream where every backend operation emits trace events. Multiple users see each other's traces plus background polling. This is a multiplexed, unbounded event log. (3) **AI analysis pipeline** — request-triggered with aggressive caching. One LLM call is amortized across all users for 1 hour. The three streams are independent but the SSE panel acts as a meta-stream, tracing operations from the other two.
-
-### "Why ECS Fargate over Lambda or EC2?"
-
-Lambda has a 15-minute execution limit and cold starts — incompatible with long-lived WebSocket/SSE connections that persist for the entire browser session. EC2 would work but requires patching, scaling configuration, and OS management. Fargate gives always-on containers with zero infrastructure management. I define the CPU/memory (0.5 vCPU, 1GB), push a Docker image, and ECS handles placement, restarts, and health checks.
-
-### "How do you handle the CloudFront + WebSocket interaction?"
-
-CloudFront natively supports WebSocket — when it receives a request with `Upgrade: websocket` header, it forwards it to the origin (ALB) and establishes a persistent connection. I added a `/ws/*` cache behavior in CloudFront that forwards all headers to the ALB. This way, both REST API and WebSocket use the same HTTPS CloudFront domain, avoiding mixed-content browser security errors.
-
-### "How did you implement observability for this project?"
-
-Four pillars through Datadog: (1) **APM** via dd-java-agent — zero-code auto-instrumentation that traces every Spring MVC request, JPA query, Redis command, and RestTemplate call. The agent JAR is downloaded at Docker build time and attached via `-javaagent` JVM flag. (2) **Custom metrics** via Micrometer with a StatsD registry — circuit breaker state, rate limiter quota, cache hit/miss ratios, LLM token consumption, and WebSocket session counts. These are pushed to the Datadog Agent over UDP port 8125. (3) **Structured logging** with logstash-logback-encoder — JSON logs in production with `dd.trace_id` for log-to-trace correlation. Dev uses human-readable format with the same trace IDs inline. (4) **RUM** via @datadog/browser-rum — page load times, user interactions, and frontend-to-backend trace linking via `allowedTracingUrls`. In production, the Datadog Agent runs as a sidecar container in the same ECS Fargate task, communicating via `localhost`.
-
-### "How do you correlate a slow user experience to a backend issue?"
-
-Datadog RUM captures the frontend request. Because `allowedTracingUrls` is configured for `/api/` routes, RUM injects trace context headers into every API call. I can click a slow RUM resource and jump directly to the backend APM trace showing the exact Spring controller, Redis cache lookup, and external API call that caused the latency. If the backend was fast but the user still experienced slowness, RUM shows whether it was network, JS execution, or resource loading.
-
-### "How do you monitor LLM costs across your AI features?"
-
-Each of the three AI services (InsightService, NewsService, NarratorService) increments Micrometer counters tagged by `direction` (input/output), `model`, and `operation` after every Claude API call. These flow through StatsD to Datadog, where I can build dashboards showing daily token burn rate per operation. Combined with cache hit rate metrics, I can see that 95% of insight requests are served from cache, so the actual LLM cost is one API call per league per hour rather than per user request.
-
-### "How did you debug the Datadog agent not receiving traces in production?"
-
-The infrastructure showed both containers running and Datadog saw them in Infrastructure → Containers, but APM → Services was empty. I debugged it layer by layer: (1) Confirmed port mappings (8126/tcp, 8125/udp) were correct on the agent container. (2) Checked backend container logs for the dd-java-agent startup banner — it wasn't appearing, which pointed to a Dockerfile issue. (3) Discovered the agent was sending data to `datadoghq.com` (US1) while our account was on `us5.datadoghq.com` — the `DD_SITE` environment variable was missing. (4) Fixed `DD_AGENT_HOST` from `datadog-agent` (Docker Compose hostname) to `localhost` (Fargate sidecar networking). (5) Fixed the Dockerfile: replaced `ADD` with `RUN curl` for reliable JAR download, and reordered JVM flags so `-javaagent` and `-D` properties came before `-jar`. After rebuilding the image and redeploying, traces appeared within 2 minutes.
-
-### "What's the difference between your System Design Panel and Datadog?"
-
-They serve different purposes. The System Design Panel is a **live, in-browser visualization** that shows how backend operations flow in real-time — it's designed for demonstrations and teaching system design concepts. You can watch a request flow from gateway → cache check → rate limiter → API call → cache write → response. Datadog is **persistent, historical, and alertable** — it stores weeks of traces, aggregates metrics over time, correlates logs with traces, and can page someone at 3am when the circuit breaker opens. The System Design Panel answers "how does this system work?" while Datadog answers "how is this system performing?"
-
-### "What would you do differently if starting over?"
-
-- **Use WebClient instead of RestTemplate** for non-blocking HTTP calls. RestTemplate is synchronous and blocks a thread per request.
-- **TypeScript on the frontend** for better type safety across the many component props.
-- **Integration tests** with Testcontainers for Redis and MySQL.
-- **OpenAPI/Swagger** for API documentation.
-- **CI/CD pipeline** with GitHub Actions: build → test → push to ECR → deploy to ECS on every push to main.
-- **AWS Secrets Manager** instead of plain environment variables for sensitive values like API keys and database passwords.
+See [INTERVIEW_QA.md](INTERVIEW_QA.md) for the full list of system design interview questions and answers.
